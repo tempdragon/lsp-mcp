@@ -1,0 +1,20 @@
+[package]
+name = "lsp-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+dashmap = "6.1.0"
+futures = "0.3.32"
+lsp-types = "0.97.0"
+rust-mcp-sdk = { version = "0.9.0", features = ["server", "client", "stdio", "macros"] }
+schemars = "1.2.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+url = "2.5.8"
+uuid = { version = "1.22.0", features = ["v4"] }
