@@ -9,6 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 
 pub struct LspClient {
     tx: mpsc::Sender<(Value, Option<oneshot::Sender<Result<Value>>>)>,
+    #[allow(dead_code)]
+    child: Option<tokio::process::Child>,
 }
 
 impl LspClient {
@@ -105,8 +107,12 @@ impl LspClient {
             }
         });
 
-        let mut client = Self { tx };
+        let mut client = Self {
+            tx,
+            child: Some(child),
+        };
 
+        #[allow(deprecated)]
         let params = InitializeParams {
             process_id: Some(std::process::id()),
             root_uri: None,
@@ -134,6 +140,21 @@ impl LspClient {
             .await?;
 
         Ok(client)
+    }
+
+    #[allow(dead_code)]
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.send_request::<lsp_types::request::Shutdown>(()).await?;
+        self.send_notification::<lsp_types::notification::Exit>(())
+            .await?;
+
+        // Give the background task a chance to flush the Exit notification.
+        // It's writing to the pipe. Then wait for the process to exit.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait().await;
+        }
+
+        Ok(())
     }
 
     async fn read_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Option<Value>> {
