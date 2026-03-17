@@ -78,31 +78,86 @@ impl SessionManager {
     pub async fn apply_workspace_edit(&self, edit: &WorkspaceEdit) -> anyhow::Result<()> {
         if let Some(changes) = &edit.changes {
             for (uri, edits) in changes {
-                let url = Url::parse(&uri.to_string())?;
-                if let Ok(path) = url.to_file_path() {
-                    let mut content = tokio::fs::read_to_string(&path).await?;
-                    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-
-                    // Apply edits in reverse order to maintain line/char offsets
-                    let mut sorted_edits = edits.clone();
-                    sorted_edits.sort_by(|a, b| {
-                        b.range
-                            .start
-                            .line
-                            .cmp(&a.range.start.line)
-                            .then(b.range.start.character.cmp(&a.range.start.character))
-                    });
-
-                    for edit in sorted_edits {
-                        self.apply_text_edit(&mut lines, &edit);
+                self.apply_text_edits_to_uri(uri, edits).await?;
+            }
+        }
+        if let Some(document_changes) = &edit.document_changes {
+            match document_changes {
+                lsp_types::DocumentChanges::Edits(edits) => {
+                    for edit in edits {
+                        self.apply_text_edits_to_uri(&edit.text_document.uri, &edit.edits.iter().cloned().map(|e| match e {
+                            lsp_types::OneOf::Left(te) => te,
+                            lsp_types::OneOf::Right(ae) => ae.text_edit,
+                        }).collect::<Vec<_>>()).await?;
                     }
-
-                    content = lines.join("\n");
-                    tokio::fs::write(&path, content).await?;
+                }
+                lsp_types::DocumentChanges::Operations(ops) => {
+                    for op in ops {
+                        match op {
+                            lsp_types::DocumentChangeOperation::Edit(edit) => {
+                                self.apply_text_edits_to_uri(&edit.text_document.uri, &edit.edits.iter().cloned().map(|e| match e {
+                                    lsp_types::OneOf::Left(te) => te,
+                                    lsp_types::OneOf::Right(ae) => ae.text_edit,
+                                }).collect::<Vec<_>>()).await?;
+                            }
+                            lsp_types::DocumentChangeOperation::Op(op) => {
+                                match op {
+                                    lsp_types::ResourceOp::Create(create) => {
+                                        let url = Url::parse(&create.uri.to_string())?;
+                                        if let Ok(path) = url.to_file_path() {
+                                            tokio::fs::write(&path, "").await?;
+                                        }
+                                    }
+                                    lsp_types::ResourceOp::Rename(rename) => {
+                                        let old_url = Url::parse(&rename.old_uri.to_string())?;
+                                        let new_url = Url::parse(&rename.new_uri.to_string())?;
+                                        if let (Ok(old_path), Ok(new_path)) = (old_url.to_file_path(), new_url.to_file_path()) {
+                                            tokio::fs::rename(old_path, new_path).await?;
+                                        }
+                                    }
+                                    lsp_types::ResourceOp::Delete(delete) => {
+                                        let url = Url::parse(&delete.uri.to_string())?;
+                                        if let Ok(path) = url.to_file_path() {
+                                            if path.is_file() {
+                                                tokio::fs::remove_file(&path).await?;
+                                            } else if path.is_dir() {
+                                                tokio::fs::remove_dir_all(&path).await?;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-        // TODO: Handle document_changes
+        Ok(())
+    }
+
+    async fn apply_text_edits_to_uri(&self, uri: &lsp_types::Uri, edits: &[lsp_types::TextEdit]) -> anyhow::Result<()> {
+        let url = Url::parse(&uri.to_string())?;
+        if let Ok(path) = url.to_file_path() {
+            let mut content = tokio::fs::read_to_string(&path).await?;
+            let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+            // Apply edits in reverse order to maintain line/char offsets
+            let mut sorted_edits = edits.to_vec();
+            sorted_edits.sort_by(|a, b| {
+                b.range
+                    .start
+                    .line
+                    .cmp(&a.range.start.line)
+                    .then(b.range.start.character.cmp(&a.range.start.character))
+            });
+
+            for edit in sorted_edits {
+                self.apply_text_edit(&mut lines, &edit);
+            }
+
+            content = lines.join("\n");
+            tokio::fs::write(&path, content).await?;
+        }
         Ok(())
     }
 

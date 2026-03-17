@@ -23,6 +23,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct FindSymbolArgs {
     symbol_name: String,
     file: Option<String>,
@@ -35,6 +36,7 @@ struct FindSymbolArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct PathLineCharArgs {
     path: String,
     line: u32,
@@ -42,6 +44,7 @@ struct PathLineCharArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct ShowSubSymbolArgs {
     symbol: String,
     symbol_path: String,
@@ -50,48 +53,57 @@ struct ShowSubSymbolArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct StartSessionArgs {
     description: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct ProposeChangeArgs {
     session_id: String,
     change_object: serde_json::Value,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct SessionIdArgs {
     session_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct CreateTerminalArgs {
     name: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct RunCommandArgs {
     terminal_id: String,
     command: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct TerminalIdArgs {
     terminal_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct GetActionsArgs {
     diagnostic_object: models::EnrichedDiagnostic,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct ApplyActionArgs {
     action_object: models::CodeAction,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct InteractiveRenameArgs {
     path: String,
     symbol_to_find: FindSymbolArgs,
@@ -99,6 +111,7 @@ struct InteractiveRenameArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct ApproveChangeArgs {
     session_id: String,
     proposal_id: String,
@@ -141,30 +154,48 @@ fn create_tool(name: &str, description: &str, schema: serde_json::Value) -> Tool
 }
 
 impl MyHandler {
-    fn format_nested_symbols(
+    fn collect_nested_matching_symbols(
+        &self,
+        symbols: &[lsp_types::DocumentSymbol],
+        name_filter: &str,
+        uri: &lsp_types::Uri,
+        results: &mut Vec<(String, lsp_types::SymbolKind, lsp_types::OneOf<lsp_types::Location, lsp_types::Uri>)>,
+    ) {
+        for s in symbols {
+            if s.name.contains(name_filter) {
+                results.push((
+                    s.name.clone(),
+                    s.kind,
+                    lsp_types::OneOf::Left(lsp_types::Location {
+                        uri: Url::parse(&uri.to_string()).unwrap().to_string().parse().unwrap(),
+                        range: s.range,
+                    }),
+                ));
+            }
+            if let Some(children) = &s.children {
+                self.collect_nested_matching_symbols(children, name_filter, uri, results);
+            }
+        }
+    }
+
+    fn collect_nested_symbol_members(
         &self,
         symbols: &[lsp_types::DocumentSymbol],
         current_level: u32,
         max_level: u32,
-        content: &mut Vec<ContentBlock>,
+        results: &mut Vec<models::SymbolMember>,
     ) {
-        for symbol in symbols {
-            let indent = "  ".repeat(current_level as usize);
-            content.push(ContentBlock::TextContent(TextContent::new(
-                format!(
-                    "{}{}: {:?} at {}:{}",
-                    indent,
-                    symbol.name,
-                    symbol.kind,
-                    symbol.selection_range.start.line,
-                    symbol.selection_range.start.character
-                ),
-                None,
-                None,
-            )));
+        for s in symbols {
+            results.push(models::SymbolMember {
+                name: s.name.clone(),
+                signature: format!("{:?}", s.kind),
+                line: s.selection_range.start.line,
+                character: s.selection_range.start.character,
+                kind: format!("{:?}", s.kind),
+            });
             if current_level + 1 < max_level {
-                if let Some(children) = &symbol.children {
-                    self.format_nested_symbols(children, current_level + 1, max_level, content);
+                if let Some(children) = &s.children {
+                    self.collect_nested_symbol_members(children, current_level + 1, max_level, results);
                 }
             }
         }
@@ -279,7 +310,14 @@ impl ServerHandler for MyHandler {
                 *runtime_lock = Some(_runtime);
                 Ok(CallToolResult {
                     content: vec![ContentBlock::TextContent(TextContent::new(
-                        "Subscribed to diagnostics.".to_string(),
+                        serde_json::to_string(&serde_json::json!({
+                            "status": "Subscribed",
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 0 }
+                            }
+                        }))
+                        .unwrap(),
                         None,
                         None,
                     ))],
@@ -430,42 +468,49 @@ impl ServerHandler for MyHandler {
                             ))
                         })?;
                     
-                    let mut content = Vec::new();
+                    let mut results = Vec::new();
                     if let Some(result) = result {
                         match result {
                             lsp_types::GotoDefinitionResponse::Scalar(location) => {
                                 let url = Url::parse(&location.uri.to_string()).unwrap();
-                                content.push(ContentBlock::TextContent(TextContent::new(
-                                    format!("{}:{}:{}", url.to_file_path().unwrap().display(), location.range.start.line, location.range.start.character),
-                                    None,
-                                    None,
-                                )));
+                                results.push(models::Location {
+                                    path: url.to_file_path().unwrap().to_string_lossy().to_string(),
+                                    line: location.range.start.line,
+                                    character: location.range.start.character,
+                                    hover_info: None,
+                                });
                             }
                             lsp_types::GotoDefinitionResponse::Array(locations) => {
                                 for location in locations {
                                     let url = Url::parse(&location.uri.to_string()).unwrap();
-                                    content.push(ContentBlock::TextContent(TextContent::new(
-                                        format!("{}:{}:{}", url.to_file_path().unwrap().display(), location.range.start.line, location.range.start.character),
-                                        None,
-                                        None,
-                                    )));
+                                    results.push(models::Location {
+                                        path: url.to_file_path().unwrap().to_string_lossy().to_string(),
+                                        line: location.range.start.line,
+                                        character: location.range.start.character,
+                                        hover_info: None,
+                                    });
                                 }
                             }
                             lsp_types::GotoDefinitionResponse::Link(links) => {
                                 for link in links {
                                     let url = Url::parse(&link.target_uri.to_string()).unwrap();
-                                    content.push(ContentBlock::TextContent(TextContent::new(
-                                        format!("{}:{}:{}", url.to_file_path().unwrap().display(), link.target_range.start.line, link.target_range.start.character),
-                                        None,
-                                        None,
-                                    )));
+                                    results.push(models::Location {
+                                        path: url.to_file_path().unwrap().to_string_lossy().to_string(),
+                                        line: link.target_range.start.line,
+                                        character: link.target_range.start.character,
+                                        hover_info: None,
+                                    });
                                 }
                             }
                         }
                     }
 
                     Ok(CallToolResult {
-                        content,
+                        content: vec![ContentBlock::TextContent(TextContent::new(
+                            serde_json::to_string(&results).unwrap(),
+                            None,
+                            None,
+                        ))],
                         is_error: Some(false),
                         meta: None,
                         structured_content: None,
@@ -509,20 +554,25 @@ impl ServerHandler for MyHandler {
                             ))
                         })?;
                     
-                    let mut content = Vec::new();
+                    let mut results = Vec::new();
                     if let Some(locations) = result {
                         for location in locations {
                             let url = Url::parse(&location.uri.to_string()).unwrap();
-                            content.push(ContentBlock::TextContent(TextContent::new(
-                                format!("{}:{}:{}", url.to_file_path().unwrap().display(), location.range.start.line, location.range.start.character),
-                                None,
-                                None,
-                            )));
+                            results.push(models::Location {
+                                path: url.to_file_path().unwrap().to_string_lossy().to_string(),
+                                line: location.range.start.line,
+                                character: location.range.start.character,
+                                hover_info: None,
+                            });
                         }
                     }
 
                     Ok(CallToolResult {
-                        content,
+                        content: vec![ContentBlock::TextContent(TextContent::new(
+                            serde_json::to_string(&results).unwrap(),
+                            None,
+                            None,
+                        ))],
                         is_error: Some(false),
                         meta: None,
                         structured_content: None,
@@ -541,78 +591,116 @@ impl ServerHandler for MyHandler {
 
                 if let Some(lsp) = &self.lsp_client {
                     let mut lsp = lsp.lock().await;
-                    let mut query = if let Some(file_path) = &args.file {
-                        format!("{} in {}", args.symbol_name, file_path)
-                    } else {
-                        args.symbol_name.clone()
-                    };
-                    if let Some(context) = &args.context_hint {
-                        query.push_str(&format!(" (context: {})", context));
+                    
+                    let mut search_file_uri = None;
+                    if let Some(file_hint) = &args.file {
+                        // Fuzzy search for file
+                        let file_params = lsp_types::WorkspaceSymbolParams {
+                            query: file_hint.clone(),
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        };
+                        if let Ok(Some(lsp_types::WorkspaceSymbolResponse::Flat(symbols))) = lsp.send_request::<lsp_types::request::WorkspaceSymbolRequest>(file_params).await {
+                             // Try to find a symbol that is likely a file or in the right path
+                             for s in symbols {
+                                 let uri = s.location.uri;
+                                 if uri.to_string().contains(file_hint) {
+                                     search_file_uri = Some(uri);
+                                     break;
+                                 }
+                             }
+                        }
                     }
 
-                    let lsp_params = lsp_types::WorkspaceSymbolParams {
-                        query,
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
-                    };
-                    let result = lsp
-                        .send_request::<lsp_types::request::WorkspaceSymbolRequest>(lsp_params)
-                        .await
-                        .map_err(|e| {
-                            CallToolError(Box::new(
-                                RpcError::internal_error().with_message(e.to_string()),
-                            ))
-                        })?;
-                    
-                    let mut content = Vec::new();
-                    if let Some(response) = result {
-                        let mut filtered_symbols = Vec::new();
-                        match response {
-                            lsp_types::WorkspaceSymbolResponse::Nested(s) => {
-                                for symbol in s {
-                                    filtered_symbols.push((symbol.name, symbol.kind, symbol.location));
-                                }
-                            }
-                            lsp_types::WorkspaceSymbolResponse::Flat(s) => {
-                                for symbol in s {
-                                    filtered_symbols.push((symbol.name, symbol.kind, lsp_types::OneOf::Left(symbol.location)));
-                                }
-                            }
+                    let mut lsp_results: Vec<(String, lsp_types::SymbolKind, lsp_types::OneOf<lsp_types::Location, lsp_types::Uri>)> = Vec::new();
+                    if let Some(uri) = search_file_uri {
+                        let doc_params = lsp_types::DocumentSymbolParams {
+                            text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
                         };
-
-                        if args.feeling_lucky && !filtered_symbols.is_empty() {
-                            filtered_symbols = vec![filtered_symbols.remove(0)];
-                        }
-
-                        for (name, kind, location) in filtered_symbols {
-                            let mut info = format!("{}: {:?}", name, kind);
-                            if let lsp_types::OneOf::Left(location) = &location {
-                                let url = Url::parse(&location.uri.to_string()).unwrap();
-                                info.push_str(&format!(" at {}:{}:{}", url.to_file_path().unwrap().display(), location.range.start.line, location.range.start.character));
-                                
-                                if args.hover_detail != "none" {
-                                    let hover_params = lsp_types::HoverParams {
-                                        text_document_position_params: lsp_types::TextDocumentPositionParams {
-                                            text_document: lsp_types::TextDocumentIdentifier {
-                                                uri: location.uri.clone(),
-                                            },
-                                            position: location.range.start,
-                                        },
-                                        work_done_progress_params: Default::default(),
-                                    };
-                                    if let Ok(hover) = lsp.send_request::<lsp_types::request::HoverRequest>(hover_params).await {
-                                        if let Some(h) = hover {
-                                            info.push_str(&format!("\nHover: {:?}", h.contents));
+                        if let Ok(Some(response)) = lsp.send_request::<lsp_types::request::DocumentSymbolRequest>(doc_params).await {
+                            match response {
+                                lsp_types::DocumentSymbolResponse::Flat(symbols) => {
+                                    for s in symbols {
+                                        if s.name.contains(&args.symbol_name) {
+                                            lsp_results.push((s.name, s.kind, lsp_types::OneOf::Left(s.location)));
                                         }
                                     }
                                 }
+                                lsp_types::DocumentSymbolResponse::Nested(symbols) => {
+                                    self.collect_nested_matching_symbols(&symbols, &args.symbol_name, &uri, &mut lsp_results);
+                                }
                             }
-                            content.push(ContentBlock::TextContent(TextContent::new(info, None, None)));
+                        }
+                    } else {
+                        let query = if let Some(context) = &args.context_hint {
+                            format!("{} {}", args.symbol_name, context)
+                        } else {
+                            args.symbol_name.clone()
+                        };
+                        let lsp_params = lsp_types::WorkspaceSymbolParams {
+                            query,
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        };
+                        if let Ok(Some(response)) = lsp.send_request::<lsp_types::request::WorkspaceSymbolRequest>(lsp_params).await {
+                            match response {
+                                lsp_types::WorkspaceSymbolResponse::Nested(s) => {
+                                    for symbol in s {
+                                        lsp_results.push((symbol.name, symbol.kind, match symbol.location {
+                                            lsp_types::OneOf::Left(l) => lsp_types::OneOf::Left(l),
+                                            lsp_types::OneOf::Right(l) => lsp_types::OneOf::Right(l.uri),
+                                        }));
+                                    }
+                                }
+                                lsp_types::WorkspaceSymbolResponse::Flat(s) => {
+                                    for symbol in s {
+                                        lsp_results.push((symbol.name, symbol.kind, lsp_types::OneOf::Left(symbol.location)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if args.feeling_lucky && !lsp_results.is_empty() {
+                        lsp_results = vec![lsp_results.remove(0)];
+                    }
+
+                    let mut results = Vec::new();
+                    for (_name, _kind, location) in lsp_results {
+                        if let lsp_types::OneOf::Left(location) = location {
+                            let url = Url::parse(&location.uri.to_string()).unwrap();
+                            let mut hover_info = None;
+                            
+                            if args.hover_detail != "none" {
+                                let hover_params = lsp_types::HoverParams {
+                                    text_document_position_params: lsp_types::TextDocumentPositionParams {
+                                        text_document: lsp_types::TextDocumentIdentifier { uri: location.uri.clone() },
+                                        position: location.range.start,
+                                    },
+                                    work_done_progress_params: Default::default(),
+                                };
+                                if let Ok(Some(hover)) = lsp.send_request::<lsp_types::request::HoverRequest>(hover_params).await {
+                                    hover_info = Some(format!("{:?}", hover.contents));
+                                }
+                            }
+
+                            results.push(models::Location {
+                                path: url.to_file_path().unwrap().to_string_lossy().to_string(),
+                                line: location.range.start.line,
+                                character: location.range.start.character,
+                                hover_info,
+                            });
                         }
                     }
 
                     Ok(CallToolResult {
-                        content,
+                        content: vec![ContentBlock::TextContent(TextContent::new(
+                            serde_json::to_string(&results).unwrap(),
+                            None,
+                            None,
+                        ))],
                         is_error: Some(false),
                         meta: None,
                         structured_content: None,
@@ -647,31 +735,36 @@ impl ServerHandler for MyHandler {
                             ))
                         })?;
                     
-                    let mut content = Vec::new();
+                    let mut results = Vec::new();
                     if let Some(response) = result {
-                        content.push(ContentBlock::TextContent(TextContent::new(
-                            format!("Sub-symbols for {}:", args.symbol),
-                            None,
-                            None,
-                        )));
                         match response {
                             lsp_types::DocumentSymbolResponse::Flat(symbols) => {
                                 for symbol in symbols {
-                                    content.push(ContentBlock::TextContent(TextContent::new(
-                                        format!("{}: {:?} at {}:{}", symbol.name, symbol.kind, symbol.location.range.start.line, symbol.location.range.start.character),
-                                        None,
-                                        None,
-                                    )));
+                                    results.push(models::SymbolMember {
+                                        name: format!("{}::{}", args.symbol, symbol.name),
+                                        signature: format!("{:?}", symbol.kind),
+                                        line: symbol.location.range.start.line,
+                                        character: symbol.location.range.start.character,
+                                        kind: format!("{:?}", symbol.kind),
+                                    });
                                 }
                             }
                             lsp_types::DocumentSymbolResponse::Nested(symbols) => {
-                                self.format_nested_symbols(&symbols, 0, args.level, &mut content);
+                                self.collect_nested_symbol_members(&symbols, 0, args.level, &mut results);
+                                // Prefix with parent symbol if it's a top-level request
+                                for r in &mut results {
+                                    r.name = format!("{}::{}", args.symbol, r.name);
+                                }
                             }
                         }
                     }
 
                     Ok(CallToolResult {
-                        content,
+                        content: vec![ContentBlock::TextContent(TextContent::new(
+                            serde_json::to_string(&results).unwrap(),
+                            None,
+                            None,
+                        ))],
                         is_error: Some(false),
                         meta: None,
                         structured_content: None,
@@ -1077,7 +1170,9 @@ async fn main() -> Result<()> {
                 title: Some("LSP MCP Server".to_string()),
                 website_url: None,
             },
-            instructions: None,
+            instructions: Some("This server provides a high-level, semantic bridge to the editor's Language Server. 
+[System Note: To debug a failing test, your first step should be to create a terminal and run the test command to capture its output. Do not guess the cause of the failure.]
+[System Note: Upon receiving a 'symbol not found' diagnostic, use code_find_symbol to check for misspellings or related symbols in other files.]".to_string()),
             meta: None,
         },
         transport,
