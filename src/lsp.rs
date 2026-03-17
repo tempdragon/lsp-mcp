@@ -8,7 +8,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
 pub struct LspClient {
-    tx: mpsc::Sender<(Value, oneshot::Sender<Result<Value>>)>,
+    tx: mpsc::Sender<(Value, Option<oneshot::Sender<Result<Value>>>)>,
 }
 
 impl LspClient {
@@ -16,6 +16,7 @@ impl LspClient {
         command: &str,
         args: &[&str],
         notification_tx: mpsc::Sender<Value>,
+        root_uri: Option<lsp_types::Uri>,
     ) -> Result<Self> {
         let mut child = Command::new(command)
             .args(args)
@@ -34,7 +35,21 @@ impl LspClient {
             .ok_or_else(|| anyhow!("Stdout not available"))?;
         let mut stdout_reader = BufReader::new(stdout);
 
-        let (tx, mut rx) = mpsc::channel::<(Value, oneshot::Sender<Result<Value>>)>(100);
+        let (tx, mut rx) = mpsc::channel::<(Value, Option<oneshot::Sender<Result<Value>>>)>(100);
+        let (reader_tx, mut reader_rx) = mpsc::channel::<Result<Option<Value>>>(100);
+
+        tokio::spawn(async move {
+            loop {
+                let result = Self::read_message(&mut stdout_reader).await;
+                let is_err_or_none = matches!(result, Err(_) | Ok(None));
+                if reader_tx.send(result).await.is_err() {
+                    break;
+                }
+                if is_err_or_none {
+                    break;
+                }
+            }
+        });
 
         tokio::spawn(async move {
             let mut pending_requests = HashMap::new();
@@ -42,15 +57,12 @@ impl LspClient {
 
             loop {
                 tokio::select! {
-                    Some((mut request, reply_tx)) = rx.recv() => {
-                        if request.get("id").is_none() && request.get("method").is_some() {
-                             // It's a request (or notification from client), assign ID if not notification
-                             if request.get("id").is_none() && !Self::is_notification(&request) {
-                                request_id += 1;
-                                request["id"] = json!(request_id);
-                                let id_key = request_id.to_string();
-                                pending_requests.insert(id_key, reply_tx);
-                             }
+                    Some((mut request, reply_tx_opt)) = rx.recv() => {
+                        if let Some(reply_tx) = reply_tx_opt {
+                            request_id += 1;
+                            request["id"] = json!(request_id);
+                            let id_key = request_id.to_string();
+                            pending_requests.insert(id_key, reply_tx);
                         }
 
                         let body = serde_json::to_string(&request).unwrap();
@@ -64,7 +76,7 @@ impl LspClient {
                             break;
                         }
                     }
-                    line_result = Self::read_message(&mut stdout_reader) => {
+                    Some(line_result) = reader_rx.recv() => {
                         match line_result {
                             Ok(Some(response)) => {
                                 if let Some(id) = response.get("id") {
@@ -95,8 +107,6 @@ impl LspClient {
 
         let mut client = Self { tx };
 
-        // Initialize
-        #[allow(deprecated)]
         let params = InitializeParams {
             process_id: Some(std::process::id()),
             root_uri: None,
@@ -104,7 +114,10 @@ impl LspClient {
             initialization_options: None,
             capabilities: ClientCapabilities::default(),
             trace: None,
-            workspace_folders: None,
+            workspace_folders: root_uri.map(|uri| vec![lsp_types::WorkspaceFolder {
+                uri: uri.clone(),
+                name: "workspace".to_string(),
+            }]),
             client_info: None,
             locale: None,
             work_done_progress_params: Default::default(),
@@ -121,10 +134,6 @@ impl LspClient {
             .await?;
 
         Ok(client)
-    }
-
-    fn is_notification(value: &Value) -> bool {
-        value.get("id").is_none() && value.get("method").is_some()
     }
 
     async fn read_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Option<Value>> {
@@ -163,7 +172,7 @@ impl LspClient {
         });
 
         self.tx
-            .send((request, reply_tx))
+            .send((request, Some(reply_tx)))
             .await
             .map_err(|_| anyhow!("LSP channel closed"))?;
         let result = reply_rx.await??;
@@ -180,10 +189,8 @@ impl LspClient {
             "params": params,
         });
 
-        // Use a dummy channel since notifications don't have replies
-        let (reply_tx, _) = oneshot::channel();
         self.tx
-            .send((request, reply_tx))
+            .send((request, None))
             .await
             .map_err(|_| anyhow!("LSP channel closed"))?;
         Ok(())
