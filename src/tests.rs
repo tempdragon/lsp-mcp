@@ -581,7 +581,7 @@ async fn test_negative_get_definition_whitespace() {
         let mut args = serde_json::Map::new();
         args.insert("path".to_string(), serde_json::json!(ctx.main_rs_path_str()));
         args.insert("line".to_string(), serde_json::json!(0));
-        args.insert("character".to_string(), serde_json::json!(4)); // Space in "mod  utils" or similar
+        args.insert("character".to_string(), serde_json::json!(3)); // Space in "mod utils;"
 
         let params = CallToolRequestParams {
             name: "editor_get_definition".to_string(),
@@ -603,7 +603,6 @@ async fn test_doctrine_workflow() {
     run_lsp_test(|ctx| async move {
         // 1. Create a file with a known error (missing semicolon or unused var)
         let broken_rs_path = ctx.project_path.join("src/broken.rs");
-        let broken_rs_content = "fn main() { let x = 1 }\n"; // Missing semicolon (error in some contexts) or just type mismatch
         // Let's use something rust-analyzer definitely gives a fix for:
         let broken_rs_content = "fn main() { let x: i32 = \"string\"; }";
         tokio::fs::write(&broken_rs_path, broken_rs_content).await.unwrap();
