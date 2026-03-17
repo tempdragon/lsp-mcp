@@ -1,7 +1,5 @@
 mod lsp;
 mod models;
-mod sessions;
-mod terminals;
 
 #[cfg(test)]
 mod tests;
@@ -55,44 +53,6 @@ struct ShowSubSymbolArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct StartSessionArgs {
-    description: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct ProposeChangeArgs {
-    session_id: String,
-    change_object: serde_json::Value,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct SessionIdArgs {
-    session_id: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct CreateTerminalArgs {
-    name: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct RunCommandArgs {
-    terminal_id: String,
-    command: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct TerminalIdArgs {
-    terminal_id: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 struct GetActionsArgs {
     diagnostic_object: models::EnrichedDiagnostic,
 }
@@ -109,13 +69,6 @@ struct InteractiveRenameArgs {
     path: String,
     symbol_to_find: FindSymbolArgs,
     new_name: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct ApproveChangeArgs {
-    session_id: String,
-    proposal_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -138,8 +91,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 struct MyHandler {
     lsp_client: Option<Arc<Mutex<lsp::LspClient>>>,
-    session_manager: Arc<sessions::SessionManager>,
-    terminal_manager: Arc<terminals::TerminalManager>,
     subscribed_to_diagnostics: AtomicBool,
     mcp_runtime: Arc<Mutex<Option<Arc<dyn McpServer>>>>,
 }
@@ -217,6 +168,118 @@ impl MyHandler {
             }
         }
     }
+
+    pub async fn apply_workspace_edit(&self, edit: &lsp_types::WorkspaceEdit) -> anyhow::Result<()> {
+        if let Some(changes) = &edit.changes {
+            for (uri, edits) in changes {
+                self.apply_text_edits_to_uri(uri, edits).await?;
+            }
+        }
+        if let Some(document_changes) = &edit.document_changes {
+            match document_changes {
+                lsp_types::DocumentChanges::Edits(edits) => {
+                    for edit in edits {
+                        self.apply_text_edits_to_uri(&edit.text_document.uri, &edit.edits.iter().cloned().map(|e| match e {
+                            lsp_types::OneOf::Left(te) => te,
+                            lsp_types::OneOf::Right(ae) => ae.text_edit,
+                        }).collect::<Vec<_>>()).await?;
+                    }
+                }
+                lsp_types::DocumentChanges::Operations(ops) => {
+                    for op in ops {
+                        match op {
+                            lsp_types::DocumentChangeOperation::Edit(edit) => {
+                                self.apply_text_edits_to_uri(&edit.text_document.uri, &edit.edits.iter().cloned().map(|e| match e {
+                                    lsp_types::OneOf::Left(te) => te,
+                                    lsp_types::OneOf::Right(ae) => ae.text_edit,
+                                }).collect::<Vec<_>>()).await?;
+                            }
+                            lsp_types::DocumentChangeOperation::Op(op) => {
+                                match op {
+                                    lsp_types::ResourceOp::Create(create) => {
+                                        let url = Url::parse(&create.uri.to_string())?;
+                                        if let Ok(path) = url.to_file_path() {
+                                            tokio::fs::write(&path, "").await?;
+                                        }
+                                    }
+                                    lsp_types::ResourceOp::Rename(rename) => {
+                                        let old_url = Url::parse(&rename.old_uri.to_string())?;
+                                        let new_url = Url::parse(&rename.new_uri.to_string())?;
+                                        if let (Ok(old_path), Ok(new_path)) = (old_url.to_file_path(), new_url.to_file_path()) {
+                                            tokio::fs::rename(old_path, new_path).await?;
+                                        }
+                                    }
+                                    lsp_types::ResourceOp::Delete(delete) => {
+                                        let url = Url::parse(&delete.uri.to_string())?;
+                                        if let Ok(path) = url.to_file_path() {
+                                            if path.is_file() {
+                                                tokio::fs::remove_file(&path).await?;
+                                            } else if path.is_dir() {
+                                                tokio::fs::remove_dir_all(&path).await?;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_text_edits_to_uri(&self, uri: &lsp_types::Uri, edits: &[lsp_types::TextEdit]) -> anyhow::Result<()> {
+        let url = Url::parse(&uri.to_string())?;
+        if let Ok(path) = url.to_file_path() {
+            let mut content = tokio::fs::read_to_string(&path).await?;
+            let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+            let mut sorted_edits = edits.to_vec();
+            sorted_edits.sort_by(|a, b| {
+                b.range.start.line.cmp(&a.range.start.line)
+                    .then(b.range.start.character.cmp(&a.range.start.character))
+            });
+
+            for edit in sorted_edits {
+                self.apply_text_edit(&mut lines, &edit);
+            }
+
+            content = lines.join("\n");
+            tokio::fs::write(&path, content).await?;
+        }
+        Ok(())
+    }
+
+    fn apply_text_edit(&self, lines: &mut Vec<String>, edit: &lsp_types::TextEdit) {
+        let start_line = edit.range.start.line as usize;
+        let start_char = edit.range.start.character as usize;
+        let end_line = edit.range.end.line as usize;
+        let end_char = edit.range.end.character as usize;
+
+        if start_line == end_line {
+            if let Some(line) = lines.get_mut(start_line) {
+                let mut new_line = String::new();
+                new_line.push_str(&line[..start_char]);
+                new_line.push_str(&edit.new_text);
+                new_line.push_str(&line[end_char..]);
+                *line = new_line;
+            }
+        } else {
+            let first_part = lines[start_line][..start_char].to_string();
+            let last_part = lines[end_line][end_char..].to_string();
+            let mut new_text_lines: Vec<String> = edit.new_text.lines().map(|s| s.to_string()).collect();
+            if edit.new_text.ends_with('\n') { new_text_lines.push(String::new()); }
+            if new_text_lines.is_empty() {
+                new_text_lines.push(first_part + &last_part);
+            } else {
+                new_text_lines[0] = first_part + &new_text_lines[0];
+                let last_idx = new_text_lines.len() - 1;
+                new_text_lines[last_idx].push_str(&last_part);
+            }
+            lines.splice(start_line..=end_line, new_text_lines);
+        }
+    }
 }
 
 #[async_trait]
@@ -251,10 +314,7 @@ impl ServerHandler for MyHandler {
         _runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<GetPromptResult, RpcError> {
         if params.name == "dynamic_guidance" {
-            let query = params
-                .arguments
-                .and_then(|a| a.get("query").cloned())
-                .unwrap_or_default();
+            let query = params.arguments.and_then(|a| a.get("query").cloned()).unwrap_or_default();
             let mut hints = Vec::new();
             if query.contains("test") || query.contains("failing") {
                 hints.push("[System Note: To debug a failing test, your first step should be to create a terminal and run the test command to capture its output. Do not guess the cause of the failure.]");
@@ -262,16 +322,11 @@ impl ServerHandler for MyHandler {
             if query.contains("not found") || query.contains("undefined") {
                 hints.push("[System Note: Upon receiving a 'symbol not found' diagnostic, use code_find_symbol to check for misspellings or related symbols in other files.]");
             }
-
             Ok(GetPromptResult {
                 description: Some("Dynamic hints based on query.".to_string()),
                 messages: vec![PromptMessage {
                     role: rust_mcp_sdk::schema::Role::User,
-                    content: ContentBlock::TextContent(TextContent::new(
-                        hints.join("\n"),
-                        None,
-                        None,
-                    )),
+                    content: ContentBlock::TextContent(TextContent::new(hints.join("\n"), None, None)),
                 }],
                 meta: None,
             })
@@ -286,97 +341,18 @@ impl ServerHandler for MyHandler {
         _runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<ListToolsResult, RpcError> {
         let tools = vec![
-            create_tool(
-                "editor_subscribe_to_diagnostics",
-                "Subscribes to proactive diagnostic notifications.",
-                serde_json::json!({ "type": "object", "properties": {} }),
-            ),
-            create_tool(
-                "code_get_actions_for_diagnostic",
-                "Fetches potential Code Actions for a diagnostic.",
-                serde_json::to_value(schemars::schema_for!(GetActionsArgs)).unwrap(),
-            ),
-            create_tool(
-                "code_apply_action",
-                "Applies a specific Code Action.",
-                serde_json::to_value(schemars::schema_for!(ApplyActionArgs)).unwrap(),
-            ),
-            create_tool(
-                "editor_get_definition",
-                "Finds the definition of a symbol.",
-                serde_json::to_value(schemars::schema_for!(PathLineCharArgs)).unwrap(),
-            ),
-            create_tool(
-                "editor_get_references",
-                "Finds all references to a symbol.",
-                serde_json::to_value(schemars::schema_for!(PathLineCharArgs)).unwrap(),
-            ),
-            create_tool(
-                "code_find_symbol",
-                "Locates symbols and retrieves information.",
-                serde_json::to_value(schemars::schema_for!(FindSymbolArgs)).unwrap(),
-            ),
-            create_tool(
-                "code_show_sub_symbol",
-                "Shows members of a symbol.",
-                serde_json::to_value(schemars::schema_for!(ShowSubSymbolArgs)).unwrap(),
-            ),
-            create_tool(
-                "refactor_start_session",
-                "Initiates a refactoring session.",
-                serde_json::to_value(schemars::schema_for!(StartSessionArgs)).unwrap(),
-            ),
-            create_tool(
-                "refactor_propose_change",
-                "Proposes a code change in a session.",
-                serde_json::to_value(schemars::schema_for!(ProposeChangeArgs)).unwrap(),
-            ),
-            create_tool(
-                "refactor_apply",
-                "Applies approved changes in a session.",
-                serde_json::to_value(schemars::schema_for!(SessionIdArgs)).unwrap(),
-            ),
-            create_tool(
-                "refactor_approve_change",
-                "Approves a proposed code change.",
-                serde_json::to_value(schemars::schema_for!(ApproveChangeArgs)).unwrap(),
-            ),
-            create_tool(
-                "refactor_interactive_rename",
-                "Initiates a workspace-wide rename.",
-                serde_json::to_value(schemars::schema_for!(InteractiveRenameArgs)).unwrap(),
-            ),
-            create_tool(
-                "shell_create_terminal",
-                "Creates a stateful terminal session.",
-                serde_json::to_value(schemars::schema_for!(CreateTerminalArgs)).unwrap(),
-            ),
-            create_tool(
-                "terminal_run_command",
-                "Executes a command in a terminal.",
-                serde_json::to_value(schemars::schema_for!(RunCommandArgs)).unwrap(),
-            ),
-            create_tool(
-                "terminal_close",
-                "Closes a terminal session.",
-                serde_json::to_value(schemars::schema_for!(TerminalIdArgs)).unwrap(),
-            ),
-            create_tool(
-                "ui_show_workspace_diagnostics",
-                "Opens the workspace diagnostics UI.",
-                serde_json::json!({ "type": "object", "properties": {} }),
-            ),
-            create_tool(
-                "filesystem_read_file",
-                "Reads the content of a file from the filesystem.",
-                serde_json::to_value(schemars::schema_for!(ReadFileArgs)).unwrap(),
-            ),
+            create_tool("editor_subscribe_to_diagnostics", "Subscribes to proactive diagnostic notifications.", serde_json::json!({ "type": "object", "properties": {} })),
+            create_tool("code_get_actions_for_diagnostic", "Fetches potential Code Actions for a diagnostic.", serde_json::to_value(schemars::schema_for!(GetActionsArgs)).unwrap()),
+            create_tool("code_apply_action", "Applies a specific Code Action.", serde_json::to_value(schemars::schema_for!(ApplyActionArgs)).unwrap()),
+            create_tool("editor_get_definition", "Finds the definition of a symbol.", serde_json::to_value(schemars::schema_for!(PathLineCharArgs)).unwrap()),
+            create_tool("editor_get_references", "Finds all references to a symbol.", serde_json::to_value(schemars::schema_for!(PathLineCharArgs)).unwrap()),
+            create_tool("code_find_symbol", "Locates symbols and retrieves information.", serde_json::to_value(schemars::schema_for!(FindSymbolArgs)).unwrap()),
+            create_tool("code_show_sub_symbol", "Shows members of a symbol.", serde_json::to_value(schemars::schema_for!(ShowSubSymbolArgs)).unwrap()),
+            create_tool("refactor_interactive_rename", "Initiates a workspace-wide rename.", serde_json::to_value(schemars::schema_for!(InteractiveRenameArgs)).unwrap()),
+            create_tool("ui_show_workspace_diagnostics", "Opens the workspace diagnostics UI.", serde_json::json!({ "type": "object", "properties": {} })),
+            create_tool("filesystem_read_file", "Reads the content of a file from the filesystem.", serde_json::to_value(schemars::schema_for!(ReadFileArgs)).unwrap()),
         ];
-        Ok(ListToolsResult {
-            tools,
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult { tools, next_cursor: None, meta: None })
     }
 
     async fn handle_call_tool_request(
@@ -393,839 +369,178 @@ impl ServerHandler for MyHandler {
                     content: vec![ContentBlock::TextContent(TextContent::new(
                         serde_json::to_string(&serde_json::json!({
                             "status": "Subscribed",
-                            "range": {
-                                "start": { "line": 0, "character": 0 },
-                                "end": { "line": 0, "character": 0 }
-                            }
-                        }))
-                        .unwrap(),
-                        None,
-                        None,
+                            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": u32::MAX, "character": u32::MAX } },
+                            "scope": "workspace"
+                        })).unwrap(),
+                        None, None,
                     ))],
-                    is_error: Some(false),
-                    meta: None,
-                    structured_content: None,
+                    is_error: Some(false), meta: None, structured_content: None,
                 })
             }
             "code_get_actions_for_diagnostic" => {
-                let args: GetActionsArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-
+                let args: GetActionsArgs = serde_json::from_value(serde_json::Value::Object(params.arguments.unwrap_or_default())).map_err(|e| CallToolError(Box::new(e)))?;
                 if let Some(lsp) = &self.lsp_client {
                     let mut lsp = lsp.lock().await;
                     let lsp_params = lsp_types::CodeActionParams {
-                        text_document: lsp_types::TextDocumentIdentifier {
-                            uri: Url::from_file_path(&args.diagnostic_object.path).unwrap().to_string().parse().unwrap(),
-                        },
-                        range: args.diagnostic_object.diagnostic["range"]
-                            .as_object()
-                            .map(|_| {
-                                serde_json::from_value(args.diagnostic_object.diagnostic["range"].clone()).unwrap()
-                            })
-                            .unwrap_or_default(),
+                        text_document: lsp_types::TextDocumentIdentifier { uri: Url::from_file_path(&args.diagnostic_object.path).unwrap().to_string().parse().unwrap() },
+                        range: serde_json::from_value(args.diagnostic_object.diagnostic["range"].clone()).unwrap_or_default(),
                         context: lsp_types::CodeActionContext {
-                            diagnostics: vec![serde_json::from_value(
-                                args.diagnostic_object.diagnostic.clone(),
-                            )
-                            .unwrap()],
-                            only: None,
-                            trigger_kind: None,
+                            diagnostics: vec![serde_json::from_value(args.diagnostic_object.diagnostic.clone()).unwrap()],
+                            only: None, trigger_kind: None,
                         },
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
+                        work_done_progress_params: Default::default(), partial_result_params: Default::default(),
                     };
-                    let result = lsp
-                        .send_request::<lsp_types::request::CodeActionRequest>(lsp_params)
-                        .await
-                        .map_err(|e| {
-                            CallToolError(Box::new(
-                                RpcError::internal_error().with_message(e.to_string()),
-                            ))
-                        })?;
+                    let result = lsp.send_request::<lsp_types::request::CodeActionRequest>(lsp_params).await
+                        .map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
                     Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            serde_json::to_string(&result).unwrap(),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(false),
-                        meta: None,
-                        structured_content: None,
+                        content: vec![ContentBlock::TextContent(TextContent::new(serde_json::to_string(&result).unwrap(), None, None))],
+                        is_error: Some(false), meta: None, structured_content: None,
                     })
-                } else {
-                    Err(CallToolError(Box::new(
-                        RpcError::internal_error().with_message("LSP not available".to_string()),
-                    )))
-                }
+                } else { Err(CallToolError(Box::new(RpcError::internal_error().with_message("LSP not available".to_string())))) }
             }
             "code_apply_action" => {
-                let args: ApplyActionArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-
-                if let Some(_lsp) = &self.lsp_client {
+                let args: ApplyActionArgs = serde_json::from_value(serde_json::Value::Object(params.arguments.unwrap_or_default())).map_err(|e| CallToolError(Box::new(e)))?;
+                if let Some(lsp_client) = &self.lsp_client {
                     if let Some(edit) = args.action_object.edit {
                         let workspace_edit: lsp_types::WorkspaceEdit = serde_json::from_value(edit).unwrap();
-                        let session_id = self.session_manager.start_session(format!("Quick Fix: {}", args.action_object.title));
-                        let prop_id = self.session_manager.propose_change(&session_id, workspace_edit).unwrap();
-                        
-                        Ok(CallToolResult {
-                            content: vec![ContentBlock::TextContent(TextContent::new(
-                                serde_json::to_string(&serde_json::json!({
-                                    "status": "SessionCreated",
-                                    "sessionId": session_id,
-                                    "proposalId": prop_id,
-                                    "message": "The fix has been added to a refactoring session. Please approve it to apply."
-                                }))
-                                .unwrap(),
-                                None,
-                                None,
-                            ))],
-                            is_error: Some(false),
-                            meta: None,
-                            structured_content: None,
-                        })
+                        self.apply_workspace_edit(&workspace_edit).await.map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
+                        Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new(format!("Applied edit for action '{}'.", args.action_object.title), None, None))], is_error: Some(false), meta: None, structured_content: None })
                     } else if let Some(command) = args.action_object.command {
+                        let mut lsp = lsp_client.lock().await;
                         let lsp_command: lsp_types::Command = serde_json::from_value(command).unwrap();
-                        let session_id = self.session_manager.start_session(format!("Command Fix: {}", args.action_object.title));
-                        let prop_id = self.session_manager.propose_command(&session_id, lsp_command).unwrap();
-                        
-                        Ok(CallToolResult {
-                            content: vec![ContentBlock::TextContent(TextContent::new(
-                                serde_json::to_string(&serde_json::json!({
-                                    "status": "SessionCreated",
-                                    "sessionId": session_id,
-                                    "proposalId": prop_id,
-                                    "message": "The command execution has been added to a refactoring session. Please approve it to execute."
-                                }))
-                                .unwrap(),
-                                None,
-                                None,
-                            ))],
-                            is_error: Some(false),
-                            meta: None,
-                            structured_content: None,
-                        })
-                    } else {
-                        Ok(CallToolResult {
-                            content: vec![ContentBlock::TextContent(TextContent::new(
-                                format!("Action '{}' has no edit or command to apply.", args.action_object.title),
-                                None,
-                                None,
-                            ))],
-                            is_error: Some(false),
-                            meta: None,
-                            structured_content: None,
-                        })
-                    }
-                } else {
-                    Err(CallToolError(Box::new(
-                        RpcError::internal_error().with_message("LSP not available".to_string()),
-                    )))
-                }
+                        let execute_params = lsp_types::ExecuteCommandParams { command: lsp_command.command, arguments: lsp_command.arguments.unwrap_or_default(), work_done_progress_params: Default::default() };
+                        let result = lsp.send_request::<lsp_types::request::ExecuteCommand>(execute_params).await.map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
+                        Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new(format!("Executed command for action '{}': {:?}", args.action_object.title, result), None, None))], is_error: Some(false), meta: None, structured_content: None })
+                    } else { Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new(format!("Action '{}' has no edit or command to apply.", args.action_object.title), None, None))], is_error: Some(false), meta: None, structured_content: None }) }
+                } else { Err(CallToolError(Box::new(RpcError::internal_error().with_message("LSP not available".to_string())))) }
             }
             "editor_get_definition" => {
-                let args: PathLineCharArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-
+                let args: PathLineCharArgs = serde_json::from_value(serde_json::Value::Object(params.arguments.unwrap_or_default())).map_err(|e| CallToolError(Box::new(e)))?;
                 if let Some(lsp) = &self.lsp_client {
                     let mut lsp = lsp.lock().await;
-                    let lsp_params = lsp_types::GotoDefinitionParams {
-                        text_document_position_params: lsp_types::TextDocumentPositionParams {
-                            text_document: lsp_types::TextDocumentIdentifier {
-                                uri: Url::from_file_path(&args.path).unwrap().to_string().parse().unwrap(),
-                            },
-                            position: lsp_types::Position {
-                                line: args.line,
-                                character: args.character,
-                            },
-                        },
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
-                    };
-                    let result = lsp
-                        .send_request::<lsp_types::request::GotoDefinition>(lsp_params)
-                        .await
-                        .map_err(|e| {
-                            CallToolError(Box::new(
-                                RpcError::internal_error().with_message(e.to_string()),
-                            ))
-                        })?;
-                    
+                    let lsp_params = lsp_types::GotoDefinitionParams { text_document_position_params: lsp_types::TextDocumentPositionParams { text_document: lsp_types::TextDocumentIdentifier { uri: Url::from_file_path(&args.path).unwrap().to_string().parse().unwrap() }, position: lsp_types::Position { line: args.line, character: args.character } }, work_done_progress_params: Default::default(), partial_result_params: Default::default() };
+                    let result = lsp.send_request::<lsp_types::request::GotoDefinition>(lsp_params).await.map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
                     let mut results = Vec::new();
-                    if let Some(result) = result {
-                        match result {
-                            lsp_types::GotoDefinitionResponse::Scalar(location) => {
-                                let url = Url::parse(&location.uri.to_string()).unwrap();
-                                results.push(models::Location {
-                                    path: url.to_file_path().unwrap().to_string_lossy().to_string(),
-                                    line: location.range.start.line,
-                                    character: location.range.start.character,
-                                    hover_info: None,
-                                });
-                            }
-                            lsp_types::GotoDefinitionResponse::Array(locations) => {
-                                for location in locations {
-                                    let url = Url::parse(&location.uri.to_string()).unwrap();
-                                    results.push(models::Location {
-                                        path: url.to_file_path().unwrap().to_string_lossy().to_string(),
-                                        line: location.range.start.line,
-                                        character: location.range.start.character,
-                                        hover_info: None,
-                                    });
-                                }
-                            }
-                            lsp_types::GotoDefinitionResponse::Link(links) => {
-                                for link in links {
-                                    let url = Url::parse(&link.target_uri.to_string()).unwrap();
-                                    results.push(models::Location {
-                                        path: url.to_file_path().unwrap().to_string_lossy().to_string(),
-                                        line: link.target_range.start.line,
-                                        character: link.target_range.start.character,
-                                        hover_info: None,
-                                    });
-                                }
-                            }
+                    if let Some(res) = result {
+                        match res {
+                            lsp_types::GotoDefinitionResponse::Scalar(location) => results.push(models::Location { path: Url::parse(&location.uri.to_string()).unwrap().to_file_path().unwrap().to_string_lossy().to_string(), line: location.range.start.line, character: location.range.start.character, hover_info: None }),
+                            lsp_types::GotoDefinitionResponse::Array(locations) => for loc in locations { results.push(models::Location { path: Url::parse(&loc.uri.to_string()).unwrap().to_file_path().unwrap().to_string_lossy().to_string(), line: loc.range.start.line, character: loc.range.start.character, hover_info: None }) },
+                            lsp_types::GotoDefinitionResponse::Link(links) => for link in links { results.push(models::Location { path: Url::parse(&link.target_uri.to_string()).unwrap().to_file_path().unwrap().to_string_lossy().to_string(), line: link.target_range.start.line, character: link.target_range.start.character, hover_info: None }) }
                         }
                     }
-
-                    Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            serde_json::to_string(&results).unwrap(),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(false),
-                        meta: None,
-                        structured_content: None,
-                    })
-                } else {
-                    Err(CallToolError(Box::new(
-                        RpcError::internal_error().with_message("LSP not available".to_string()),
-                    )))
-                }
+                    Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new(serde_json::to_string(&results).unwrap(), None, None))], is_error: Some(false), meta: None, structured_content: None })
+                } else { Err(CallToolError(Box::new(RpcError::internal_error().with_message("LSP not available".to_string())))) }
             }
             "editor_get_references" => {
-                let args: PathLineCharArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-
+                let args: PathLineCharArgs = serde_json::from_value(serde_json::Value::Object(params.arguments.unwrap_or_default())).map_err(|e| CallToolError(Box::new(e)))?;
                 if let Some(lsp) = &self.lsp_client {
                     let mut lsp = lsp.lock().await;
-                    let lsp_params = lsp_types::ReferenceParams {
-                        text_document_position: lsp_types::TextDocumentPositionParams {
-                            text_document: lsp_types::TextDocumentIdentifier {
-                                uri: Url::from_file_path(&args.path).unwrap().to_string().parse().unwrap(),
-                            },
-                            position: lsp_types::Position {
-                                line: args.line,
-                                character: args.character,
-                            },
-                        },
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
-                        context: lsp_types::ReferenceContext {
-                            include_declaration: true,
-                        },
-                    };
-                    let result = lsp
-                        .send_request::<lsp_types::request::References>(lsp_params)
-                        .await
-                        .map_err(|e| {
-                            CallToolError(Box::new(
-                                RpcError::internal_error().with_message(e.to_string()),
-                            ))
-                        })?;
-                    
+                    let lsp_params = lsp_types::ReferenceParams { text_document_position: lsp_types::TextDocumentPositionParams { text_document: lsp_types::TextDocumentIdentifier { uri: Url::from_file_path(&args.path).unwrap().to_string().parse().unwrap() }, position: lsp_types::Position { line: args.line, character: args.character } }, work_done_progress_params: Default::default(), partial_result_params: Default::default(), context: lsp_types::ReferenceContext { include_declaration: true } };
+                    let result = lsp.send_request::<lsp_types::request::References>(lsp_params).await.map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
                     let mut results = Vec::new();
                     if let Some(locations) = result {
-                        for location in locations {
-                            let url = Url::parse(&location.uri.to_string()).unwrap();
-                            results.push(models::Location {
-                                path: url.to_file_path().unwrap().to_string_lossy().to_string(),
-                                line: location.range.start.line,
-                                character: location.range.start.character,
-                                hover_info: None,
-                            });
-                        }
+                        for location in locations { results.push(models::Location { path: Url::parse(&location.uri.to_string()).unwrap().to_file_path().unwrap().to_string_lossy().to_string(), line: location.range.start.line, character: location.range.start.character, hover_info: None }); }
                     }
-
-                    Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            serde_json::to_string(&results).unwrap(),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(false),
-                        meta: None,
-                        structured_content: None,
-                    })
-                } else {
-                    Err(CallToolError(Box::new(
-                        RpcError::internal_error().with_message("LSP not available".to_string()),
-                    )))
-                }
+                    Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new(serde_json::to_string(&results).unwrap(), None, None))], is_error: Some(false), meta: None, structured_content: None })
+                } else { Err(CallToolError(Box::new(RpcError::internal_error().with_message("LSP not available".to_string())))) }
             }
             "code_find_symbol" => {
-                let args: FindSymbolArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-
-                if let Some(lsp) = &self.lsp_client {
-                    let mut lsp = lsp.lock().await;
-                    
+                let args: FindSymbolArgs = serde_json::from_value(serde_json::Value::Object(params.arguments.unwrap_or_default())).map_err(|e| CallToolError(Box::new(e)))?;
+                if let Some(lsp_client) = &self.lsp_client {
+                    let mut lsp = lsp_client.lock().await;
                     let mut search_file_uri = None;
                     if let Some(file_hint) = &args.file {
-                        // Fuzzy search for file
-                        let file_params = lsp_types::WorkspaceSymbolParams {
-                            query: file_hint.clone(),
-                            work_done_progress_params: Default::default(),
-                            partial_result_params: Default::default(),
-                        };
+                        let file_params = lsp_types::WorkspaceSymbolParams { query: file_hint.clone(), work_done_progress_params: Default::default(), partial_result_params: Default::default() };
                         if let Ok(Some(lsp_types::WorkspaceSymbolResponse::Flat(symbols))) = lsp.send_request::<lsp_types::request::WorkspaceSymbolRequest>(file_params).await {
                              let mut matches = Vec::new();
                              for s in symbols {
                                  let uri = s.location.uri;
-                                 if uri.to_string().contains(file_hint) {
-                                     if !matches.contains(&uri) {
-                                         matches.push(uri);
-                                     }
-                                 }
+                                 if uri.to_string().contains(file_hint) && !matches.contains(&uri) { matches.push(uri); }
                              }
-                             if matches.len() > 1 {
-                                 return Err(CallToolError(Box::new(RpcError::internal_error().with_message(format!("Ambiguous file name '{}'. Matches: {:?}", file_hint, matches)))));
-                             }
+                             if matches.len() > 1 { return Err(CallToolError(Box::new(RpcError::internal_error().with_message(format!("Ambiguous file name '{}'. Matches: {:?}", file_hint, matches))))); }
                              search_file_uri = matches.into_iter().next();
                         }
                     }
-
                     let mut lsp_results: Vec<(String, lsp_types::SymbolKind, lsp_types::OneOf<lsp_types::Location, lsp_types::Uri>)> = Vec::new();
                     if let Some(uri) = search_file_uri {
-                        let doc_params = lsp_types::DocumentSymbolParams {
-                            text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
-                            work_done_progress_params: Default::default(),
-                            partial_result_params: Default::default(),
-                        };
+                        let doc_params = lsp_types::DocumentSymbolParams { text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() }, work_done_progress_params: Default::default(), partial_result_params: Default::default() };
                         if let Ok(Some(response)) = lsp.send_request::<lsp_types::request::DocumentSymbolRequest>(doc_params).await {
                             match response {
-                                lsp_types::DocumentSymbolResponse::Flat(symbols) => {
-                                    for s in symbols {
-                                        if s.name.contains(&args.symbol_name) {
-                                            lsp_results.push((s.name, s.kind, lsp_types::OneOf::Left(s.location)));
-                                        }
-                                    }
-                                }
-                                lsp_types::DocumentSymbolResponse::Nested(symbols) => {
-                                    self.collect_nested_matching_symbols(&symbols, &args.symbol_name, &uri, &mut lsp_results);
-                                }
+                                lsp_types::DocumentSymbolResponse::Flat(symbols) => for s in symbols { if s.name.contains(&args.symbol_name) { lsp_results.push((s.name, s.kind, lsp_types::OneOf::Left(s.location))); } },
+                                lsp_types::DocumentSymbolResponse::Nested(symbols) => self.collect_nested_matching_symbols(&symbols, &args.symbol_name, &uri, &mut lsp_results),
                             }
                         }
-                        
-                        // Use locationHint to disambiguate
-                        if let Some(hint) = args.location_hint {
-                            lsp_results.sort_by_key(|(_, _, loc)| {
-                                if let lsp_types::OneOf::Left(l) = loc {
-                                    let d_line = (l.range.start.line as i32 - hint.line as i32).abs();
-                                    let d_char = (l.range.start.character as i32 - hint.character as i32).abs();
-                                    d_line * 1000 + d_char
-                                } else {
-                                    i32::MAX
-                                }
-                            });
-                        }
+                        if let Some(hint) = args.location_hint { lsp_results.sort_by_key(|(_, _, loc)| { if let lsp_types::OneOf::Left(l) = loc { let d_line = (l.range.start.line as i32 - hint.line as i32).abs(); let d_char = (l.range.start.character as i32 - hint.character as i32).abs(); d_line * 1000 + d_char } else { i32::MAX } }); }
                     } else {
-                        let query = if let Some(context) = &args.context_hint {
-                            format!("{} {}", args.symbol_name, context)
-                        } else {
-                            args.symbol_name.clone()
-                        };
-                        let lsp_params = lsp_types::WorkspaceSymbolParams {
-                            query,
-                            work_done_progress_params: Default::default(),
-                            partial_result_params: Default::default(),
-                        };
+                        let query = if let Some(context) = &args.context_hint { format!("{} {}", args.symbol_name, context) } else { args.symbol_name.clone() };
+                        let lsp_params = lsp_types::WorkspaceSymbolParams { query, work_done_progress_params: Default::default(), partial_result_params: Default::default() };
                         if let Ok(Some(response)) = lsp.send_request::<lsp_types::request::WorkspaceSymbolRequest>(lsp_params).await {
                             match response {
-                                lsp_types::WorkspaceSymbolResponse::Nested(s) => {
-                                    for symbol in s {
-                                        lsp_results.push((symbol.name, symbol.kind, match symbol.location {
-                                            lsp_types::OneOf::Left(l) => lsp_types::OneOf::Left(l),
-                                            lsp_types::OneOf::Right(l) => lsp_types::OneOf::Right(l.uri),
-                                        }));
-                                    }
-                                }
-                                lsp_types::WorkspaceSymbolResponse::Flat(s) => {
-                                    for symbol in s {
-                                        lsp_results.push((symbol.name, symbol.kind, lsp_types::OneOf::Left(symbol.location)));
-                                    }
-                                }
+                                lsp_types::WorkspaceSymbolResponse::Nested(s) => for symbol in s { lsp_results.push((symbol.name, symbol.kind, match symbol.location { lsp_types::OneOf::Left(l) => lsp_types::OneOf::Left(l), lsp_types::OneOf::Right(l) => lsp_types::OneOf::Right(l.uri) })); },
+                                lsp_types::WorkspaceSymbolResponse::Flat(s) => for symbol in s { lsp_results.push((symbol.name, symbol.kind, lsp_types::OneOf::Left(symbol.location))); }
                             }
                         }
                     }
-
-                    if args.feeling_lucky && !lsp_results.is_empty() {
-                        lsp_results = vec![lsp_results.remove(0)];
-                    }
-
+                    if args.feeling_lucky && !lsp_results.is_empty() { lsp_results = vec![lsp_results.remove(0)]; }
                     let mut results = Vec::new();
                     for (_name, _kind, location) in lsp_results {
                         if let lsp_types::OneOf::Left(location) = location {
                             let url = Url::parse(&location.uri.to_string()).unwrap();
                             let mut hover_info = None;
-                            
                             if args.hover_detail != "none" {
-                                let hover_params = lsp_types::HoverParams {
-                                    text_document_position_params: lsp_types::TextDocumentPositionParams {
-                                        text_document: lsp_types::TextDocumentIdentifier { uri: location.uri.clone() },
-                                        position: location.range.start,
-                                    },
-                                    work_done_progress_params: Default::default(),
-                                };
-                                if let Ok(Some(hover)) = lsp.send_request::<lsp_types::request::HoverRequest>(hover_params).await {
-                                    hover_info = Some(format!("{:?}", hover.contents));
-                                }
+                                let hover_params = lsp_types::HoverParams { text_document_position_params: lsp_types::TextDocumentPositionParams { text_document: lsp_types::TextDocumentIdentifier { uri: location.uri.clone() }, position: location.range.start }, work_done_progress_params: Default::default() };
+                                if let Ok(Some(hover)) = lsp.send_request::<lsp_types::request::HoverRequest>(hover_params).await { hover_info = Some(format!("{:?}", hover.contents)); }
                             }
-
-                            results.push(models::Location {
-                                path: url.to_file_path().unwrap().to_string_lossy().to_string(),
-                                line: location.range.start.line,
-                                character: location.range.start.character,
-                                hover_info,
-                            });
+                            results.push(models::Location { path: url.to_file_path().unwrap().to_string_lossy().to_string(), line: location.range.start.line, character: location.range.start.character, hover_info });
                         }
                     }
-
-                    Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            serde_json::to_string(&results).unwrap(),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(false),
-                        meta: None,
-                        structured_content: None,
-                    })
-                } else {
-                    Err(CallToolError(Box::new(
-                        RpcError::internal_error().with_message("LSP not available".to_string()),
-                    )))
-                }
+                    Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new(serde_json::to_string(&results).unwrap(), None, None))], is_error: Some(false), meta: None, structured_content: None })
+                } else { Err(CallToolError(Box::new(RpcError::internal_error().with_message("LSP not available".to_string())))) }
             }
             "code_show_sub_symbol" => {
-                let args: ShowSubSymbolArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-
-                if let Some(lsp) = &self.lsp_client {
-                    let mut lsp = lsp.lock().await;
+                let args: ShowSubSymbolArgs = serde_json::from_value(serde_json::Value::Object(params.arguments.unwrap_or_default())).map_err(|e| CallToolError(Box::new(e)))?;
+                if let Some(lsp_client) = &self.lsp_client {
+                    let mut lsp = lsp_client.lock().await;
                     let uri: lsp_types::Uri = Url::from_file_path(&args.symbol_path).unwrap().to_string().parse().unwrap();
-                    let lsp_params = lsp_types::DocumentSymbolParams {
-                        text_document: lsp_types::TextDocumentIdentifier {
-                            uri: uri.clone(),
-                        },
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
-                    };
-                    let result = lsp
-                        .send_request::<lsp_types::request::DocumentSymbolRequest>(lsp_params)
-                        .await
-                        .map_err(|e| {
-                            CallToolError(Box::new(
-                                RpcError::internal_error().with_message(e.to_string()),
-                            ))
-                        })?;
-                    
+                    let lsp_params = lsp_types::DocumentSymbolParams { text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() }, work_done_progress_params: Default::default(), partial_result_params: Default::default() };
+                    let result = lsp.send_request::<lsp_types::request::DocumentSymbolRequest>(lsp_params).await.map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
                     let mut results = Vec::new();
                     if let Some(response) = result {
                         let path = Url::parse(&uri.to_string()).unwrap().to_file_path().unwrap();
                         let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
                         let lines: Vec<&str> = content.lines().collect();
-
                         match response {
-                            lsp_types::DocumentSymbolResponse::Flat(symbols) => {
-                                for symbol in symbols {
-                                    let signature = lines.get(symbol.location.range.start.line as usize).cloned().map(|l| self.clean_signature(l)).unwrap_or_default();
-                                    results.push(models::SymbolMember {
-                                        name: format!("{}::{}", args.symbol, symbol.name),
-                                        signature,
-                                        line: symbol.location.range.start.line,
-                                        character: symbol.location.range.start.character,
-                                        kind: format!("{:?}", symbol.kind),
-                                    });
-                                }
-                            }
-                            lsp_types::DocumentSymbolResponse::Nested(symbols) => {
-                                self.collect_nested_symbol_members(&symbols, 0, args.level, &mut results, &lines);
-                                // Prefix with parent symbol if it's a top-level request
-                                for r in &mut results {
-                                    r.name = format!("{}::{}", args.symbol, r.name);
-                                }
-                            }
+                            lsp_types::DocumentSymbolResponse::Flat(symbols) => for symbol in symbols { let signature = lines.get(symbol.location.range.start.line as usize).cloned().map(|l| self.clean_signature(l)).unwrap_or_default(); results.push(models::SymbolMember { name: format!("{}::{}", args.symbol, symbol.name), signature, line: symbol.location.range.start.line, character: symbol.location.range.start.character, kind: format!("{:?}", symbol.kind) }); },
+                            lsp_types::DocumentSymbolResponse::Nested(symbols) => { self.collect_nested_symbol_members(&symbols, 0, args.level, &mut results, &lines); for r in &mut results { r.name = format!("{}::{}", args.symbol, r.name); } }
                         }
                     }
-
-                    Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            serde_json::to_string(&results).unwrap(),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(false),
-                        meta: None,
-                        structured_content: None,
-                    })
-                } else {
-                    Err(CallToolError(Box::new(
-                        RpcError::internal_error().with_message("LSP not available".to_string()),
-                    )))
-                }
-            }
-            "refactor_start_session" => {
-                let args: StartSessionArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-                let id = self.session_manager.start_session(args.description);
-                Ok(CallToolResult {
-                    content: vec![ContentBlock::TextContent(TextContent::new(
-                        format!("Session started with ID: {}", id),
-                        None,
-                        None,
-                    ))],
-                    is_error: Some(false),
-                    meta: None,
-                    structured_content: None,
-                })
-            }
-            "refactor_propose_change" => {
-                let args: ProposeChangeArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-                let edit: lsp_types::WorkspaceEdit = serde_json::from_value(args.change_object)
-                    .map_err(|e| CallToolError(Box::new(e)))?;
-                if let Some(prop_id) = self.session_manager.propose_change(&args.session_id, edit) {
-                    Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            format!("Proposal added: {}", prop_id),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(false),
-                        meta: None,
-                        structured_content: None,
-                    })
-                } else {
-                    Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            format!("Session {} not found", args.session_id),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(true),
-                        meta: None,
-                        structured_content: None,
-                    })
-                }
-            }
-            "refactor_apply" => {
-                let args: SessionIdArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-                if let Some((edits, commands)) = self.session_manager.apply_approved(&args.session_id).await {
-                    if !commands.is_empty() {
-                        if let Some(lsp_client) = &self.lsp_client {
-                            let mut lsp = lsp_client.lock().await;
-                            for cmd_val in &commands {
-                                let lsp_command: lsp_types::Command = serde_json::from_value(cmd_val.clone()).unwrap();
-                                let execute_params = lsp_types::ExecuteCommandParams {
-                                    command: lsp_command.command,
-                                    arguments: lsp_command.arguments.unwrap_or_default(),
-                                    work_done_progress_params: Default::default(),
-                                };
-                                let _ = lsp.send_request::<lsp_types::request::ExecuteCommand>(execute_params).await;
-                            }
-                        }
-                    }
-
-                    Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            format!(
-                                "Applied {} approved changes and executed {} commands for session {}.",
-                                edits.len(),
-                                commands.len(),
-                                args.session_id
-                            ),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(false),
-                        meta: None,
-                        structured_content: None,
-                    })
-                } else {
-                    Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            format!("Session {} not found", args.session_id),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(true),
-                        meta: None,
-                        structured_content: None,
-                    })
-                }
-            }
-            "refactor_approve_change" => {
-                let args: ApproveChangeArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-                if self
-                    .session_manager
-                    .approve_proposal(&args.session_id, &args.proposal_id)
-                {
-                    Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            format!(
-                                "Proposal {} approved for session {}.",
-                                args.proposal_id, args.session_id
-                            ),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(false),
-                        meta: None,
-                        structured_content: None,
-                    })
-                } else {
-                    Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            format!(
-                                "Proposal {} or Session {} not found",
-                                args.proposal_id, args.session_id
-                            ),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(true),
-                        meta: None,
-                        structured_content: None,
-                    })
-                }
+                    Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new(serde_json::to_string(&results).unwrap(), None, None))], is_error: Some(false), meta: None, structured_content: None })
+                } else { Err(CallToolError(Box::new(RpcError::internal_error().with_message("LSP not available".to_string())))) }
             }
             "refactor_interactive_rename" => {
-                let args: InteractiveRenameArgs = serde_json::from_value(
-                    serde_json::Value::Object(params.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| CallToolError(Box::new(e)))?;
-
-                if let Some(lsp) = &self.lsp_client {
-                    let mut lsp = lsp.lock().await;
-                    let position =
-                        args.symbol_to_find.location_hint.clone().unwrap_or(models::Position {
-                            line: 0,
-                            character: 0,
-                        });
-                    let lsp_params = lsp_types::RenameParams {
-                        text_document_position: lsp_types::TextDocumentPositionParams {
-                            text_document: lsp_types::TextDocumentIdentifier {
-                                uri: Url::from_file_path(&args.path).unwrap().to_string().parse().unwrap(),
-                            },
-                            position: lsp_types::Position {
-                                line: position.line,
-                                character: position.character,
-                            },
-                        },
-                        new_name: args.new_name.clone(),
-                        work_done_progress_params: Default::default(),
-                    };
-
-                    let result = lsp
-                        .send_request::<lsp_types::request::Rename>(lsp_params)
-                        .await
-                        .map_err(|e| {
-                            CallToolError(Box::new(
-                                RpcError::internal_error().with_message(e.to_string()),
-                            ))
-                        })?;
-
+                let args: InteractiveRenameArgs = serde_json::from_value(serde_json::Value::Object(params.arguments.unwrap_or_default())).map_err(|e| CallToolError(Box::new(e)))?;
+                if let Some(lsp_client) = &self.lsp_client {
+                    let mut lsp = lsp_client.lock().await;
+                    let position = args.symbol_to_find.location_hint.clone().unwrap_or(models::Position { line: 0, character: 0 });
+                    let lsp_params = lsp_types::RenameParams { text_document_position: lsp_types::TextDocumentPositionParams { text_document: lsp_types::TextDocumentIdentifier { uri: Url::from_file_path(&args.path).unwrap().to_string().parse().unwrap() }, position: lsp_types::Position { line: position.line, character: position.character } }, new_name: args.new_name.clone(), work_done_progress_params: Default::default() };
+                    let result = lsp.send_request::<lsp_types::request::Rename>(lsp_params).await.map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
                     if let Some(edit) = result {
-                        let session_id = self.session_manager.start_session(format!(
-                            "Rename {} to {}",
-                            args.symbol_to_find.symbol_name, args.new_name
-                        ));
-                        self.session_manager.propose_change(&session_id, edit);
-                        Ok(CallToolResult {
-                            content: vec![ContentBlock::TextContent(TextContent::new(
-                                serde_json::to_string(&serde_json::json!({
-                                    "status": "Initiated",
-                                    "sessionId": session_id,
-                                    "message": "Workspace edits proposed and added to session."
-                                }))
-                                .unwrap(),
-                                None,
-                                None,
-                            ))],
-                            is_error: Some(false),
-                            meta: None,
-                            structured_content: None,
-                        })
-                    } else {
-                        Ok(CallToolResult {
-                            content: vec![ContentBlock::TextContent(TextContent::new(
-                                "LSP returned no edits for rename.".to_string(),
-                                None,
-                                None,
-                            ))],
-                            is_error: Some(true),
-                            meta: None,
-                            structured_content: None,
-                        })
-                    }
-                } else {
-                    Err(CallToolError(Box::new(
-                        RpcError::internal_error().with_message("LSP not available".to_string()),
-                    )))
-                }
-            }
-            "shell_create_terminal" => {
-                let args: CreateTerminalArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-                let id = self.terminal_manager.create_terminal().map_err(|e| {
-                    CallToolError(Box::new(
-                        RpcError::internal_error().with_message(e.to_string()),
-                    ))
-                })?;
-                Ok(CallToolResult {
-                    content: vec![ContentBlock::TextContent(TextContent::new(
-                        format!(
-                            "Terminal '{}' created with ID: {}",
-                            args.name.unwrap_or_default(),
-                            id
-                        ),
-                        None,
-                        None,
-                    ))],
-                    is_error: Some(false),
-                    meta: None,
-                    structured_content: None,
-                })
-            }
-            "terminal_run_command" => {
-                let args: RunCommandArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-                match self
-                    .terminal_manager
-                    .run_command(&args.terminal_id, &args.command)
-                    .await
-                {
-                    Ok((stdout, stderr)) => Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            format!(
-                                "Terminal {}: stdout: {}\nstderr: {}",
-                                args.terminal_id, stdout, stderr
-                            ),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(false),
-                        meta: None,
-                        structured_content: None,
-                    }),
-                    Err(e) => Ok(CallToolResult {
-                        content: vec![ContentBlock::TextContent(TextContent::new(
-                            format!("Terminal {}: error: {}", args.terminal_id, e),
-                            None,
-                            None,
-                        ))],
-                        is_error: Some(true),
-                        meta: None,
-                        structured_content: None,
-                    }),
-                }
-            }
-            "terminal_close" => {
-                let args: TerminalIdArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-                let closed = self.terminal_manager.close_terminal(&args.terminal_id);
-                Ok(CallToolResult {
-                    content: vec![ContentBlock::TextContent(TextContent::new(
-                        format!("Terminal {} closed: {}", args.terminal_id, closed),
-                        None,
-                        None,
-                    ))],
-                    is_error: Some(false),
-                    meta: None,
-                    structured_content: None,
-                })
+                        self.apply_workspace_edit(&edit).await.map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
+                        Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new(serde_json::to_string(&serde_json::json!({ "status": "Applied", "message": "Rename successful." })).unwrap(), None, None))], is_error: Some(false), meta: None, structured_content: None })
+                    } else { Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new("LSP returned no edits for rename.", None, None))], is_error: Some(true), meta: None, structured_content: None }) }
+                } else { Err(CallToolError(Box::new(RpcError::internal_error().with_message("LSP not available".to_string())))) }
             }
             "ui_show_workspace_diagnostics" => {
-                // In a real implementation, this would send a notification to the client to open the diagnostics UI.
                 let runtime = self.mcp_runtime.lock().await;
-                if let Some(runtime) = runtime.as_ref() {
-                    let _ = runtime
-                        .send_notification(
-                            rust_mcp_sdk::schema::NotificationFromServer::CustomNotification(
-                                rust_mcp_sdk::schema::CustomNotification {
-                                    method: "ui/showDiagnostics".to_string(),
-                                    params: None,
-                                },
-                            ),
-                        )
-                        .await;
-                }
-                Ok(CallToolResult {
-                    content: vec![ContentBlock::TextContent(TextContent::new(
-                        "Workspace diagnostics UI opened.".to_string(),
-                        None,
-                        None,
-                    ))],
-                    is_error: Some(false),
-                    meta: None,
-                    structured_content: None,
-                })
+                if let Some(runtime) = runtime.as_ref() { let _ = runtime.send_notification(rust_mcp_sdk::schema::NotificationFromServer::CustomNotification(rust_mcp_sdk::schema::CustomNotification { method: "ui/showDiagnostics".to_string(), params: None })).await; }
+                Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new("Workspace diagnostics UI opened.", None, None))], is_error: Some(false), meta: None, structured_content: None })
             }
             "filesystem_read_file" => {
-                let args: ReadFileArgs = serde_json::from_value(serde_json::Value::Object(
-                    params.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| CallToolError(Box::new(e)))?;
-                let content = tokio::fs::read_to_string(&args.path).await.map_err(|e| {
-                    CallToolError(Box::new(
-                        RpcError::internal_error().with_message(e.to_string()),
-                    ))
-                })?;
-                Ok(CallToolResult {
-                    content: vec![ContentBlock::TextContent(TextContent::new(
-                        content,
-                        None,
-                        None,
-                    ))],
-                    is_error: Some(false),
-                    meta: None,
-                    structured_content: None,
-                })
+                let args: ReadFileArgs = serde_json::from_value(serde_json::Value::Object(params.arguments.unwrap_or_default())).map_err(|e| CallToolError(Box::new(e)))?;
+                let content = tokio::fs::read_to_string(&args.path).await.map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
+                Ok(CallToolResult { content: vec![ContentBlock::TextContent(TextContent::new(content, None, None))], is_error: Some(false), meta: None, structured_content: None })
             }
-            _ => Err(CallToolError(Box::new(
-                RpcError::method_not_found()
-                    .with_message(format!("Tool {} not found", params.name)),
-            ))),
+            _ => Err(CallToolError(Box::new(RpcError::method_not_found().with_message(format!("Tool {} not found", params.name))))),
         }
     }
 }
@@ -1235,94 +550,54 @@ use url::Url;
 #[tokio::main]
 async fn main() -> Result<()> {
     let (notification_tx, mut notification_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(100);
-
     let lsp_client = match lsp::LspClient::start("rust-analyzer", &[], notification_tx).await {
         Ok(client) => Some(Arc::new(Mutex::new(client))),
-        Err(e) => {
-            eprintln!("Warning: Could not start rust-analyzer: {}", e);
-            None
-        }
+        Err(e) => { eprintln!("Warning: Could not start rust-analyzer: {}", e); None }
     };
-
-    let session_manager = Arc::new(sessions::SessionManager::new());
-    let terminal_manager = Arc::new(terminals::TerminalManager::new());
     let mcp_runtime: Arc<Mutex<Option<Arc<dyn McpServer>>>> = Arc::new(Mutex::new(None));
-
-    let handler = MyHandler {
-        lsp_client: lsp_client.clone(),
-        session_manager: session_manager.clone(),
-        terminal_manager: terminal_manager.clone(),
-        subscribed_to_diagnostics: AtomicBool::new(false),
-        mcp_runtime: mcp_runtime.clone(),
-    };
-
+    let handler = MyHandler { lsp_client: lsp_client.clone(), subscribed_to_diagnostics: AtomicBool::new(false), mcp_runtime: mcp_runtime.clone() };
     let runtime_for_notifications = mcp_runtime.clone();
     let lsp_client_for_enrichment = lsp_client.clone();
     tokio::spawn(async move {
         while let Some(mut notif) = notification_rx.recv().await {
             if let Some(method) = notif.get("method").and_then(|m| m.as_str()) {
                 if method == "textDocument/publishDiagnostics" {
-                    // Enrich diagnostics
                     if let Some(params) = notif.get_mut("params") {
                         let uri_str = params.get("uri").and_then(|u| u.as_str()).map(|s| s.to_string());
-                        if let (Some(uri_str), Some(diagnostics)) = (
-                            uri_str,
-                            params.get_mut("diagnostics").and_then(|d| d.as_array_mut()),
-                        ) {
+                        if let (Some(uri_str), Some(diagnostics)) = (uri_str, params.get_mut("diagnostics").and_then(|d| d.as_array_mut())) {
                             if let Ok(url) = Url::parse(&uri_str) {
                                 if let Ok(path) = url.to_file_path() {
                                     if let Ok(content) = tokio::fs::read_to_string(&path).await {
                                         let lines: Vec<&str> = content.lines().collect();
-                                        
-                                        // Optional: Query LSP for document symbols to get semantic context
                                         let mut doc_symbols = Vec::new();
                                         if let Some(lsp_client) = &lsp_client_for_enrichment {
                                             let mut lsp = lsp_client.lock().await;
                                             let lsp_uri: lsp_types::Uri = uri_str.parse().unwrap();
-                                            let symbol_params = lsp_types::DocumentSymbolParams {
-                                                text_document: lsp_types::TextDocumentIdentifier { uri: lsp_uri },
-                                                work_done_progress_params: Default::default(),
-                                                partial_result_params: Default::default(),
-                                            };
+                                            let symbol_params = lsp_types::DocumentSymbolParams { text_document: lsp_types::TextDocumentIdentifier { uri: lsp_uri }, work_done_progress_params: Default::default(), partial_result_params: Default::default() };
                                             if let Ok(Some(response)) = lsp.send_request::<lsp_types::request::DocumentSymbolRequest>(symbol_params).await {
                                                 match response {
                                                     lsp_types::DocumentSymbolResponse::Flat(s) => doc_symbols = s.into_iter().map(|si| (si.name, si.location.range)).collect(),
                                                     lsp_types::DocumentSymbolResponse::Nested(s) => {
                                                         fn flatten(symbols: Vec<lsp_types::DocumentSymbol>, target: &mut Vec<(String, lsp_types::Range)>) {
-                                                            for s in symbols {
-                                                                target.push((s.name, s.range));
-                                                                if let Some(children) = s.children { flatten(children, target); }
-                                                            }
+                                                            for s in symbols { target.push((s.name, s.range)); if let Some(children) = s.children { flatten(children, target); } }
                                                         }
                                                         flatten(s, &mut doc_symbols);
                                                     }
                                                 }
                                             }
                                         }
-
                                         for diag in diagnostics {
                                             if let Some(range) = diag.get("range") {
                                                 let start_line = range["start"]["line"].as_u64().unwrap_or(0) as usize;
                                                 let start_char = range["start"]["character"].as_u64().unwrap_or(0) as usize;
                                                 let end_char = range["end"]["character"].as_u64().unwrap_or(0) as usize;
-                                                
                                                 if start_line < lines.len() {
                                                     let line = lines[start_line];
                                                     diag["line_content"] = serde_json::json!(line);
-                                                    
-                                                    // Try to find semantic symbol name first
                                                     let diag_range: lsp_types::Range = serde_json::from_value(diag["range"].clone()).unwrap();
-                                                    let semantic_name = doc_symbols.iter().find(|(_, r)| {
-                                                        r.start.line <= diag_range.start.line && r.end.line >= diag_range.end.line &&
-                                                        (r.start.line != diag_range.start.line || r.start.character <= diag_range.start.character) &&
-                                                        (r.end.line != diag_range.end.line || r.end.character >= diag_range.end.character)
-                                                    }).map(|(n, _)| n.clone());
-
-                                                    if let Some(name) = semantic_name {
-                                                        diag["symbol_name"] = serde_json::json!(name);
-                                                    } else if end_char > start_char && end_char <= line.len() {
-                                                        diag["symbol_name"] = serde_json::json!(&line[start_char..end_char]);
-                                                    }
+                                                    let semantic_name = doc_symbols.iter().find(|(_, r)| r.start.line <= diag_range.start.line && r.end.line >= diag_range.end.line && (r.start.line != diag_range.start.line || r.start.character <= diag_range.start.character) && (r.end.line != diag_range.end.line || r.end.character >= diag_range.end.character)).map(|(n, _)| n.clone());
+                                                    if let Some(name) = semantic_name { diag["symbol_name"] = serde_json::json!(name); diag["symbol_name_source"] = serde_json::json!("semantic"); }
+                                                    else if end_char > start_char && end_char <= line.len() { diag["symbol_name"] = serde_json::json!(&line[start_char..end_char]); diag["symbol_name_source"] = serde_json::json!("textual"); }
                                                 }
                                             }
                                             diag["path"] = serde_json::json!(path.to_string_lossy());
@@ -1332,66 +607,36 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-
                     let runtime = runtime_for_notifications.lock().await;
-                    if let Some(runtime) = runtime.as_ref() {
-                        let _ = runtime
-                            .send_notification(
-                                rust_mcp_sdk::schema::NotificationFromServer::CustomNotification(
-                                    rust_mcp_sdk::schema::CustomNotification {
-                                        method: "notifications/diagnostics".to_string(),
-                                        params: Some(notif["params"].as_object().cloned().unwrap_or_default()),
-                                    },
-                                ),
-                            )
-                            .await;
-                    }
+                    if let Some(runtime) = runtime.as_ref() { let _ = runtime.send_notification(rust_mcp_sdk::schema::NotificationFromServer::CustomNotification(rust_mcp_sdk::schema::CustomNotification { method: "notifications/diagnostics".to_string(), params: Some(notif["params"].as_object().cloned().unwrap_or_default()) })).await; }
                 }
             }
         }
     });
-
-    let transport = StdioTransport::new(TransportOptions::default())
-        .map_err(|e| anyhow::anyhow!("Failed to create StdioTransport: {:?}", e))?;
-
+    let transport = StdioTransport::new(TransportOptions::default()).map_err(|e| anyhow::anyhow!("Failed to create StdioTransport: {:?}", e))?;
     let options = McpServerOptions {
         server_details: InitializeResult {
             protocol_version: "2024-11-05".to_string(),
-            capabilities: rust_mcp_sdk::schema::ServerCapabilities {
-                prompts: Some(rust_mcp_sdk::schema::ServerCapabilitiesPrompts {
-                    list_changed: Some(false),
-                }),
-                ..Default::default()
-            },
+            capabilities: rust_mcp_sdk::schema::ServerCapabilities { prompts: Some(rust_mcp_sdk::schema::ServerCapabilitiesPrompts { list_changed: Some(false) }), ..Default::default() },
             server_info: Implementation {
-                name: "lsp-mcp".into(),
-                version: "1.16".into(),
-                description: Some(
-                    "LSP-MCP server implementing AI Development Specification 1.16".to_string(),
-                ),
-                icons: vec![],
-                title: Some("LSP MCP Server".to_string()),
-                website_url: None,
+                name: "lsp-mcp".into(), version: "1.16".into(),
+                description: Some("LSP-MCP server implementing AI Development Specification 1.16".to_string()),
+                icons: vec![], title: Some("LSP MCP Server".to_string()), website_url: None,
             },
-            instructions: Some("This server provides a high-level, semantic bridge to the editor's Language Server. 
-[System Note: To debug a failing test, your first step should be to create a terminal and run the test command to capture its output. Do not guess the cause of the failure.]
-[System Note: Upon receiving a 'symbol not found' diagnostic, use code_find_symbol to check for misspellings or related symbols in other files.]".to_string()),
+            instructions: Some("You are Gemini CLI, acting as an advanced semantic agent.
+- DOCTRINE 1 (PLAN): Generate and present a multi-step plan before non-trivial tool calls.
+- DOCTRINE 2 (VERIFY): After writing files, verify using 'filesystem_read_file' or terminal commands.
+- DOCTRINE 3 (PROPOSE): ALL codebase modifications (edits or commands) MUST be proposed via refactoring sessions for human approval.
+- DOCTRINE 4 (DEBUG): Use 'code_find_symbol' as the first step for 'undefined' or 'not found' errors.
+[System Action: The server provides context-aware hints via the 'dynamic_guidance' prompt tool when you detect keywords like 'test', 'failing', or 'not found'].".to_string()),
             meta: None,
         },
         transport,
         handler: rust_mcp_sdk::mcp_server::ToMcpServerHandler::to_mcp_server_handler(handler),
-        task_store: None,
-        client_task_store: None,
-        message_observer: None,
+        task_store: None, client_task_store: None, message_observer: None,
     };
-
     let server = create_server(options);
-
     eprintln!("LSP-MCP server running on stdio...");
-    server
-        .start()
-        .await
-        .map_err(|e| anyhow::anyhow!("Server error: {:?}", e))?;
-
+    server.start().await.map_err(|e| anyhow::anyhow!("Server error: {:?}", e))?;
     Ok(())
 }

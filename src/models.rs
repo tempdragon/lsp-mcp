@@ -44,20 +44,3 @@ pub struct SymbolMember {
     pub character: u32,
     pub kind: String,
 }
-
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RefactorSession {
-    pub id: String,
-    pub description: String,
-    pub proposals: Vec<RefactorProposal>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RefactorProposal {
-    pub id: String,
-    pub change: Option<serde_json::Value>, // WorkspaceEdit
-    pub command: Option<serde_json::Value>, // Command
-    pub approved: bool,
-}
