@@ -31,7 +31,23 @@ impl SessionManager {
             let proposal_id = Uuid::new_v4().to_string();
             session.proposals.push(RefactorProposal {
                 id: proposal_id.clone(),
-                change: serde_json::to_value(change).unwrap(),
+                change: Some(serde_json::to_value(change).unwrap()),
+                command: None,
+                approved: false,
+            });
+            Some(proposal_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn propose_command(&self, session_id: &str, command: lsp_types::Command) -> Option<String> {
+        if let Some(mut session) = self.sessions.get_mut(session_id) {
+            let proposal_id = Uuid::new_v4().to_string();
+            session.proposals.push(RefactorProposal {
+                id: proposal_id.clone(),
+                change: None,
+                command: Some(serde_json::to_value(command).unwrap()),
                 approved: false,
             });
             Some(proposal_id)
@@ -50,26 +66,24 @@ impl SessionManager {
         false
     }
 
-    pub async fn apply_approved(&self, session_id: &str) -> Option<Vec<serde_json::Value>> {
+    pub async fn apply_approved(&self, session_id: &str) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
         if let Some(session) = self.sessions.remove(session_id) {
-            let approved_edits: Vec<WorkspaceEdit> = session
-                .1
-                .proposals
-                .into_iter()
-                .filter(|p| p.approved)
-                .map(|p| serde_json::from_value(p.change).unwrap())
-                .collect();
+            let mut applied_edits = Vec::new();
+            let mut applied_commands = Vec::new();
 
-            for edit in &approved_edits {
-                let _ = self.apply_workspace_edit(edit).await;
+            for proposal in session.1.proposals.into_iter().filter(|p| p.approved) {
+                if let Some(change_val) = proposal.change {
+                    let edit: WorkspaceEdit = serde_json::from_value(change_val.clone()).unwrap();
+                    if self.apply_workspace_edit(&edit).await.is_ok() {
+                        applied_edits.push(change_val);
+                    }
+                }
+                if let Some(command_val) = proposal.command {
+                    applied_commands.push(command_val);
+                }
             }
 
-            Some(
-                approved_edits
-                    .into_iter()
-                    .map(|e| serde_json::to_value(e).unwrap())
-                    .collect(),
-            )
+            Some((applied_edits, applied_commands))
         } else {
             None
         }

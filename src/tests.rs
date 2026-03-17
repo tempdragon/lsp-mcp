@@ -23,7 +23,26 @@ async fn test_session_manager() {
     assert!(sm.approve_proposal(&id, &prop_id));
     
     let approved = sm.apply_approved(&id).await.unwrap();
-    assert_eq!(approved.len(), 1);
+    assert_eq!(approved.0.len(), 1);
+}
+
+#[tokio::test]
+async fn test_session_manager_commands() {
+    let sm = SessionManager::new();
+    let id = sm.start_session("Command session".to_string());
+
+    let command = lsp_types::Command {
+        title: "Test Command".to_string(),
+        command: "test.command".to_string(),
+        arguments: None,
+    };
+
+    let prop_id = sm.propose_command(&id, command).unwrap();
+    assert!(sm.approve_proposal(&id, &prop_id));
+
+    let approved = sm.apply_approved(&id).await.unwrap();
+    assert_eq!(approved.1.len(), 1);
+    assert_eq!(approved.1[0]["command"], "test.command");
 }
 
 #[tokio::test]

@@ -57,6 +57,7 @@ pub struct RefactorSession {
 #[serde(rename_all = "camelCase")]
 pub struct RefactorProposal {
     pub id: String,
-    pub change: serde_json::Value,
+    pub change: Option<serde_json::Value>, // WorkspaceEdit
+    pub command: Option<serde_json::Value>, // Command
     pub approved: bool,
 }

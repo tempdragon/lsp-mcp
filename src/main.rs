@@ -489,18 +489,19 @@ impl ServerHandler for MyHandler {
                             structured_content: None,
                         })
                     } else if let Some(command) = args.action_object.command {
-                        let mut lsp = _lsp.lock().await;
                         let lsp_command: lsp_types::Command = serde_json::from_value(command).unwrap();
-                        let execute_params = lsp_types::ExecuteCommandParams {
-                            command: lsp_command.command,
-                            arguments: lsp_command.arguments.unwrap_or_default(),
-                            work_done_progress_params: Default::default(),
-                        };
-                        let result = lsp.send_request::<lsp_types::request::ExecuteCommand>(execute_params).await
-                            .map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
+                        let session_id = self.session_manager.start_session(format!("Command Fix: {}", args.action_object.title));
+                        let prop_id = self.session_manager.propose_command(&session_id, lsp_command).unwrap();
+                        
                         Ok(CallToolResult {
                             content: vec![ContentBlock::TextContent(TextContent::new(
-                                format!("Executed command for action '{}': {:?}", args.action_object.title, result),
+                                serde_json::to_string(&serde_json::json!({
+                                    "status": "SessionCreated",
+                                    "sessionId": session_id,
+                                    "proposalId": prop_id,
+                                    "message": "The command execution has been added to a refactoring session. Please approve it to execute."
+                                }))
+                                .unwrap(),
                                 None,
                                 None,
                             ))],
@@ -940,12 +941,28 @@ impl ServerHandler for MyHandler {
                     params.arguments.unwrap_or_default(),
                 ))
                 .map_err(|e| CallToolError(Box::new(e)))?;
-                if let Some(changes) = self.session_manager.apply_approved(&args.session_id).await {
+                if let Some((edits, commands)) = self.session_manager.apply_approved(&args.session_id).await {
+                    if !commands.is_empty() {
+                        if let Some(lsp_client) = &self.lsp_client {
+                            let mut lsp = lsp_client.lock().await;
+                            for cmd_val in &commands {
+                                let lsp_command: lsp_types::Command = serde_json::from_value(cmd_val.clone()).unwrap();
+                                let execute_params = lsp_types::ExecuteCommandParams {
+                                    command: lsp_command.command,
+                                    arguments: lsp_command.arguments.unwrap_or_default(),
+                                    work_done_progress_params: Default::default(),
+                                };
+                                let _ = lsp.send_request::<lsp_types::request::ExecuteCommand>(execute_params).await;
+                            }
+                        }
+                    }
+
                     Ok(CallToolResult {
                         content: vec![ContentBlock::TextContent(TextContent::new(
                             format!(
-                                "Applied {} approved changes for session {}.",
-                                changes.len(),
+                                "Applied {} approved changes and executed {} commands for session {}.",
+                                edits.len(),
+                                commands.len(),
                                 args.session_id
                             ),
                             None,
@@ -1240,6 +1257,7 @@ async fn main() -> Result<()> {
     };
 
     let runtime_for_notifications = mcp_runtime.clone();
+    let lsp_client_for_enrichment = lsp_client.clone();
     tokio::spawn(async move {
         while let Some(mut notif) = notification_rx.recv().await {
             if let Some(method) = notif.get("method").and_then(|m| m.as_str()) {
@@ -1255,6 +1273,33 @@ async fn main() -> Result<()> {
                                 if let Ok(path) = url.to_file_path() {
                                     if let Ok(content) = tokio::fs::read_to_string(&path).await {
                                         let lines: Vec<&str> = content.lines().collect();
+                                        
+                                        // Optional: Query LSP for document symbols to get semantic context
+                                        let mut doc_symbols = Vec::new();
+                                        if let Some(lsp_client) = &lsp_client_for_enrichment {
+                                            let mut lsp = lsp_client.lock().await;
+                                            let lsp_uri: lsp_types::Uri = uri_str.parse().unwrap();
+                                            let symbol_params = lsp_types::DocumentSymbolParams {
+                                                text_document: lsp_types::TextDocumentIdentifier { uri: lsp_uri },
+                                                work_done_progress_params: Default::default(),
+                                                partial_result_params: Default::default(),
+                                            };
+                                            if let Ok(Some(response)) = lsp.send_request::<lsp_types::request::DocumentSymbolRequest>(symbol_params).await {
+                                                match response {
+                                                    lsp_types::DocumentSymbolResponse::Flat(s) => doc_symbols = s.into_iter().map(|si| (si.name, si.location.range)).collect(),
+                                                    lsp_types::DocumentSymbolResponse::Nested(s) => {
+                                                        fn flatten(symbols: Vec<lsp_types::DocumentSymbol>, target: &mut Vec<(String, lsp_types::Range)>) {
+                                                            for s in symbols {
+                                                                target.push((s.name, s.range));
+                                                                if let Some(children) = s.children { flatten(children, target); }
+                                                            }
+                                                        }
+                                                        flatten(s, &mut doc_symbols);
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         for diag in diagnostics {
                                             if let Some(range) = diag.get("range") {
                                                 let start_line = range["start"]["line"].as_u64().unwrap_or(0) as usize;
@@ -1265,8 +1310,17 @@ async fn main() -> Result<()> {
                                                     let line = lines[start_line];
                                                     diag["line_content"] = serde_json::json!(line);
                                                     
-                                                    // Try to extract symbol_name
-                                                    if end_char > start_char && end_char <= line.len() {
+                                                    // Try to find semantic symbol name first
+                                                    let diag_range: lsp_types::Range = serde_json::from_value(diag["range"].clone()).unwrap();
+                                                    let semantic_name = doc_symbols.iter().find(|(_, r)| {
+                                                        r.start.line <= diag_range.start.line && r.end.line >= diag_range.end.line &&
+                                                        (r.start.line != diag_range.start.line || r.start.character <= diag_range.start.character) &&
+                                                        (r.end.line != diag_range.end.line || r.end.character >= diag_range.end.character)
+                                                    }).map(|(n, _)| n.clone());
+
+                                                    if let Some(name) = semantic_name {
+                                                        diag["symbol_name"] = serde_json::json!(name);
+                                                    } else if end_char > start_char && end_char <= line.len() {
                                                         diag["symbol_name"] = serde_json::json!(&line[start_char..end_char]);
                                                     }
                                                 }
