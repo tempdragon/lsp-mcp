@@ -1,5 +1,6 @@
 mod lsp;
 mod models;
+mod mock_server;
 
 #[cfg(test)]
 mod tests;
@@ -1150,6 +1151,9 @@ use url::Url;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let is_manual = args.contains(&"--manual".to_string());
+
     let (notification_tx, mut notification_rx) =
         tokio::sync::mpsc::channel::<serde_json::Value>(100);
     let current_dir = std::env::current_dir()?;
@@ -1169,6 +1173,32 @@ async fn main() -> Result<()> {
         subscribed_to_diagnostics: AtomicBool::new(false),
         mcp_runtime: mcp_runtime.clone(),
     };
+
+    if is_manual {
+        eprintln!("Manual mode started. Type 'help' for available tools or 'exit' to quit.");
+        let mut lines = std::io::stdin().lines();
+        while let Some(Ok(line)) = lines.next() {
+            let line = line.trim();
+            if line == "exit" || line == "quit" { break; }
+            if line == "help" {
+                let tools = handler.handle_list_tools_request(None, Arc::new(mock_server::MockMcpServer::new())).await.unwrap();
+                for t in tools.tools { eprintln!("- {}: {}", t.name, t.description.unwrap_or_default()); }
+                continue;
+            }
+            if let Some((name, json_args)) = line.split_once(' ') {
+                let arguments: Option<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(json_args).ok();
+                let params = CallToolRequestParams { name: name.to_string(), arguments, meta: None, task: None };
+                match handler.handle_call_tool_request(params, Arc::new(mock_server::MockMcpServer::new())).await {
+                    Ok(res) => println!("{}", serde_json::to_string_pretty(&res).unwrap()),
+                    Err(e) => eprintln!("Error: {:?}", e),
+                }
+            } else {
+                eprintln!("Usage: <tool_name> <json_arguments>");
+            }
+        }
+        return Ok(());
+    }
+
     let runtime_for_notifications = mcp_runtime.clone();
     let lsp_client_for_enrichment = lsp_client.clone();
     tokio::spawn(async move {
