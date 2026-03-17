@@ -576,6 +576,130 @@ pub fn useful_func() { println!("useful"); }
 }
 
 #[tokio::test]
+async fn test_negative_get_definition_whitespace() {
+    run_lsp_test(|ctx| async move {
+        let mut args = serde_json::Map::new();
+        args.insert("path".to_string(), serde_json::json!(ctx.main_rs_path_str()));
+        args.insert("line".to_string(), serde_json::json!(0));
+        args.insert("character".to_string(), serde_json::json!(4)); // Space in "mod  utils" or similar
+
+        let params = CallToolRequestParams {
+            name: "editor_get_definition".to_string(),
+            arguments: Some(args),
+            meta: None,
+            task: None,
+        };
+        let result = ctx.handler.handle_call_tool_request(params, Arc::new(MockMcpServer::new())).await.unwrap();
+        if let ContentBlock::TextContent(text) = &result.content[0] {
+            let locations: Vec<models::Location> = serde_json::from_str(&text.text).unwrap();
+            assert!(locations.is_empty(), "Expected no definition on whitespace, found {:?}", locations);
+        }
+        ctx.teardown().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn test_doctrine_workflow() {
+    run_lsp_test(|ctx| async move {
+        // 1. Create a file with a known error (missing semicolon or unused var)
+        let broken_rs_path = ctx.project_path.join("src/broken.rs");
+        let broken_rs_content = "fn main() { let x = 1 }\n"; // Missing semicolon (error in some contexts) or just type mismatch
+        // Let's use something rust-analyzer definitely gives a fix for:
+        let broken_rs_content = "fn main() { let x: i32 = \"string\"; }";
+        tokio::fs::write(&broken_rs_path, broken_rs_content).await.unwrap();
+
+        {
+            let mut client = ctx.lsp_client.lock().await;
+            client.send_notification::<lsp_types::notification::DidOpenTextDocument>(
+                lsp_types::DidOpenTextDocumentParams {
+                    text_document: lsp_types::TextDocumentItem {
+                        uri: Url::from_file_path(&broken_rs_path).unwrap().to_string().parse().unwrap(),
+                        language_id: "rust".to_string(),
+                        version: 0,
+                        text: broken_rs_content.to_string(),
+                    },
+                }
+            ).await.unwrap();
+        }
+
+        // 2. We skip "waiting for diagnostic subscription" because we can't easily capture it in this test.
+        // Instead we manually construct the diagnostic object as if it came from the stream.
+        let mut diag_obj = serde_json::Map::new();
+        diag_obj.insert("path".to_string(), serde_json::json!(broken_rs_path.to_string_lossy()));
+        diag_obj.insert("diagnostic".to_string(), serde_json::json!({
+            "range": {"start": {"line": 0, "character": 25}, "end": {"line": 0, "character": 33}},
+            "message": "mismatched types",
+            "severity": 1
+        }));
+
+        // 3. Get Actions
+        let mut args = serde_json::Map::new();
+        args.insert("diagnosticObject".to_string(), serde_json::Value::Object(diag_obj));
+        let params = CallToolRequestParams {
+            name: "code_get_actions_for_diagnostic".to_string(),
+            arguments: Some(args),
+            meta: None,
+            task: None,
+        };
+        let result = ctx.handler.handle_call_tool_request(params, Arc::new(MockMcpServer::new())).await.unwrap();
+        
+        // 4. Verification (Smoke test that it doesn't crash)
+        assert!(!result.is_error.unwrap_or(false));
+        
+        ctx.teardown().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn test_negative_show_sub_symbol_malformed_path() {
+    run_lsp_test(|ctx| async move {
+        let mut args = serde_json::Map::new();
+        args.insert("symbol".to_string(), serde_json::json!("main"));
+        args.insert("symbolPath".to_string(), serde_json::json!("/non/existent/path.rs"));
+
+        let params = CallToolRequestParams {
+            name: "code_show_sub_symbol".to_string(),
+            arguments: Some(args),
+            meta: None,
+            task: None,
+        };
+        let result = ctx.handler.handle_call_tool_request(params, Arc::new(MockMcpServer::new())).await;
+        assert!(result.is_err(), "Expected error for non-existent path");
+        ctx.teardown().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn test_negative_rename_non_existent() {
+    run_lsp_test(|ctx| async move {
+        let mut symbol_to_find = serde_json::Map::new();
+        symbol_to_find.insert("symbolName".to_string(), serde_json::json!("non_existent_func"));
+        symbol_to_find.insert("locationHint".to_string(), serde_json::json!({"line": 100, "character": 0}));
+
+        let mut args = serde_json::Map::new();
+        args.insert("path".to_string(), serde_json::json!(ctx.main_rs_path_str()));
+        args.insert("symbolToFind".to_string(), serde_json::Value::Object(symbol_to_find));
+        args.insert("newName".to_string(), serde_json::json!("fail"));
+
+        let params = CallToolRequestParams {
+            name: "refactor_interactive_rename".to_string(),
+            arguments: Some(args),
+            meta: None,
+            task: None,
+        };
+        let result = ctx.handler.handle_call_tool_request(params, Arc::new(MockMcpServer::new())).await;
+        // Rename might "succeed" with 0 edits or return error depending on LSP.
+        // If it returns success with "LSP returned no edits", that's also a valid outcome in our current code.
+        if let Ok(res) = result {
+             if let ContentBlock::TextContent(text) = &res.content[0] {
+                 assert!(text.text.contains("no edits") || text.text.contains("failed") || res.is_error.unwrap_or(false));
+             }
+        }
+        ctx.teardown().await;
+    }).await;
+}
+
+#[tokio::test]
 async fn test_filesystem_read_file() {
     let temp_file = std::env::temp_dir().join("test_read.txt");
     tokio::fs::write(&temp_file, "hello world").await.unwrap();

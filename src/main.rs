@@ -1149,10 +1149,27 @@ impl ServerHandler for MyHandler {
 
 use url::Url;
 
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Start in manual mode
+    #[arg(long)]
+    manual: bool,
+
+    /// One-shot tool call (manual mode only)
+    #[arg(long)]
+    call: Option<String>,
+
+    /// JSON arguments for the tool call (manual mode only)
+    #[arg(long)]
+    args: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let is_manual = args.contains(&"--manual".to_string());
+    let cli = Cli::parse();
 
     let (notification_tx, mut notification_rx) =
         tokio::sync::mpsc::channel::<serde_json::Value>(100);
@@ -1174,7 +1191,20 @@ async fn main() -> Result<()> {
         mcp_runtime: mcp_runtime.clone(),
     };
 
-    if is_manual {
+    if cli.manual {
+        if let Some(tool_name) = cli.call {
+            let arguments: Option<serde_json::Map<String, serde_json::Value>> = cli.args.as_ref().and_then(|a| serde_json::from_str(a).ok());
+            let params = CallToolRequestParams { name: tool_name, arguments, meta: None, task: None };
+            match handler.handle_call_tool_request(params, Arc::new(mock_server::MockMcpServer::new())).await {
+                Ok(res) => println!("{}", serde_json::to_string_pretty(&res).unwrap()),
+                Err(e) => {
+                    eprintln!("Error: {:?}", e);
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+
         eprintln!("Manual mode started. Type 'help' for available tools or 'exit' to quit.");
         let mut lines = std::io::stdin().lines();
         while let Some(Ok(line)) = lines.next() {
