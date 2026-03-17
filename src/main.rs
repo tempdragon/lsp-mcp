@@ -14,8 +14,9 @@ use rust_mcp_sdk::TransportOptions;
 use rust_mcp_sdk::mcp_server::server_runtime::create_server;
 use rust_mcp_sdk::mcp_server::{McpServerOptions, ServerHandler};
 use rust_mcp_sdk::schema::{
-    CallToolError, CallToolRequestParams, CallToolResult, ContentBlock, Implementation,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, RpcError, TextContent, Tool,
+    CallToolError, CallToolRequestParams, CallToolResult, ContentBlock, GetPromptRequestParams,
+    GetPromptResult, Implementation, InitializeResult, ListPromptsResult, ListToolsResult,
+    PaginatedRequestParams, Prompt, PromptMessage, RpcError, TextContent, Tool,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -117,6 +118,12 @@ struct ApproveChangeArgs {
     proposal_id: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ReadFileArgs {
+    path: String,
+}
+
 fn default_hover_detail() -> String {
     "signature".to_string()
 }
@@ -154,6 +161,14 @@ fn create_tool(name: &str, description: &str, schema: serde_json::Value) -> Tool
 }
 
 impl MyHandler {
+    fn clean_signature(&self, line: &str) -> String {
+        line.trim()
+            .trim_end_matches('{')
+            .trim_end_matches(';')
+            .trim()
+            .to_string()
+    }
+
     fn collect_nested_matching_symbols(
         &self,
         symbols: &[lsp_types::DocumentSymbol],
@@ -184,18 +199,20 @@ impl MyHandler {
         current_level: u32,
         max_level: u32,
         results: &mut Vec<models::SymbolMember>,
+        lines: &[&str],
     ) {
         for s in symbols {
+            let signature = lines.get(s.selection_range.start.line as usize).cloned().map(|l| self.clean_signature(l)).unwrap_or_default();
             results.push(models::SymbolMember {
                 name: s.name.clone(),
-                signature: format!("{:?}", s.kind),
+                signature,
                 line: s.selection_range.start.line,
                 character: s.selection_range.start.character,
                 kind: format!("{:?}", s.kind),
             });
             if current_level + 1 < max_level {
                 if let Some(children) = &s.children {
-                    self.collect_nested_symbol_members(children, current_level + 1, max_level, results);
+                    self.collect_nested_symbol_members(children, current_level + 1, max_level, results, lines);
                 }
             }
         }
@@ -204,6 +221,65 @@ impl MyHandler {
 
 #[async_trait]
 impl ServerHandler for MyHandler {
+    async fn handle_list_prompts_request(
+        &self,
+        _params: Option<PaginatedRequestParams>,
+        _runtime: Arc<dyn McpServer>,
+    ) -> std::result::Result<ListPromptsResult, RpcError> {
+        Ok(ListPromptsResult {
+            prompts: vec![Prompt {
+                name: "dynamic_guidance".to_string(),
+                description: Some("Provides just-in-time guidance based on context.".to_string()),
+                arguments: vec![rust_mcp_sdk::schema::PromptArgument {
+                    name: "query".to_string(),
+                    description: Some("The user's query to analyze.".to_string()),
+                    required: Some(true),
+                    title: None,
+                }],
+                icons: vec![],
+                meta: None,
+                title: None,
+            }],
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn handle_get_prompt_request(
+        &self,
+        params: GetPromptRequestParams,
+        _runtime: Arc<dyn McpServer>,
+    ) -> std::result::Result<GetPromptResult, RpcError> {
+        if params.name == "dynamic_guidance" {
+            let query = params
+                .arguments
+                .and_then(|a| a.get("query").cloned())
+                .unwrap_or_default();
+            let mut hints = Vec::new();
+            if query.contains("test") || query.contains("failing") {
+                hints.push("[System Note: To debug a failing test, your first step should be to create a terminal and run the test command to capture its output. Do not guess the cause of the failure.]");
+            }
+            if query.contains("not found") || query.contains("undefined") {
+                hints.push("[System Note: Upon receiving a 'symbol not found' diagnostic, use code_find_symbol to check for misspellings or related symbols in other files.]");
+            }
+
+            Ok(GetPromptResult {
+                description: Some("Dynamic hints based on query.".to_string()),
+                messages: vec![PromptMessage {
+                    role: rust_mcp_sdk::schema::Role::User,
+                    content: ContentBlock::TextContent(TextContent::new(
+                        hints.join("\n"),
+                        None,
+                        None,
+                    )),
+                }],
+                meta: None,
+            })
+        } else {
+            Err(RpcError::method_not_found())
+        }
+    }
+
     async fn handle_list_tools_request(
         &self,
         _params: Option<PaginatedRequestParams>,
@@ -289,6 +365,11 @@ impl ServerHandler for MyHandler {
                 "ui_show_workspace_diagnostics",
                 "Opens the workspace diagnostics UI.",
                 serde_json::json!({ "type": "object", "properties": {} }),
+            ),
+            create_tool(
+                "filesystem_read_file",
+                "Reads the content of a file from the filesystem.",
+                serde_json::to_value(schemars::schema_for!(ReadFileArgs)).unwrap(),
             ),
         ];
         Ok(ListToolsResult {
@@ -385,15 +466,21 @@ impl ServerHandler for MyHandler {
                 ))
                 .map_err(|e| CallToolError(Box::new(e)))?;
 
-                if let Some(lsp) = &self.lsp_client {
-                    let mut lsp = lsp.lock().await;
+                if let Some(_lsp) = &self.lsp_client {
                     if let Some(edit) = args.action_object.edit {
                         let workspace_edit: lsp_types::WorkspaceEdit = serde_json::from_value(edit).unwrap();
-                        self.session_manager.apply_workspace_edit(&workspace_edit).await
-                            .map_err(|e| CallToolError(Box::new(RpcError::internal_error().with_message(e.to_string()))))?;
+                        let session_id = self.session_manager.start_session(format!("Quick Fix: {}", args.action_object.title));
+                        let prop_id = self.session_manager.propose_change(&session_id, workspace_edit).unwrap();
+                        
                         Ok(CallToolResult {
                             content: vec![ContentBlock::TextContent(TextContent::new(
-                                format!("Applied edit for action '{}'.", args.action_object.title),
+                                serde_json::to_string(&serde_json::json!({
+                                    "status": "SessionCreated",
+                                    "sessionId": session_id,
+                                    "proposalId": prop_id,
+                                    "message": "The fix has been added to a refactoring session. Please approve it to apply."
+                                }))
+                                .unwrap(),
                                 None,
                                 None,
                             ))],
@@ -402,6 +489,7 @@ impl ServerHandler for MyHandler {
                             structured_content: None,
                         })
                     } else if let Some(command) = args.action_object.command {
+                        let mut lsp = _lsp.lock().await;
                         let lsp_command: lsp_types::Command = serde_json::from_value(command).unwrap();
                         let execute_params = lsp_types::ExecuteCommandParams {
                             command: lsp_command.command,
@@ -601,14 +689,19 @@ impl ServerHandler for MyHandler {
                             partial_result_params: Default::default(),
                         };
                         if let Ok(Some(lsp_types::WorkspaceSymbolResponse::Flat(symbols))) = lsp.send_request::<lsp_types::request::WorkspaceSymbolRequest>(file_params).await {
-                             // Try to find a symbol that is likely a file or in the right path
+                             let mut matches = Vec::new();
                              for s in symbols {
                                  let uri = s.location.uri;
                                  if uri.to_string().contains(file_hint) {
-                                     search_file_uri = Some(uri);
-                                     break;
+                                     if !matches.contains(&uri) {
+                                         matches.push(uri);
+                                     }
                                  }
                              }
+                             if matches.len() > 1 {
+                                 return Err(CallToolError(Box::new(RpcError::internal_error().with_message(format!("Ambiguous file name '{}'. Matches: {:?}", file_hint, matches)))));
+                             }
+                             search_file_uri = matches.into_iter().next();
                         }
                     }
 
@@ -632,6 +725,19 @@ impl ServerHandler for MyHandler {
                                     self.collect_nested_matching_symbols(&symbols, &args.symbol_name, &uri, &mut lsp_results);
                                 }
                             }
+                        }
+                        
+                        // Use locationHint to disambiguate
+                        if let Some(hint) = args.location_hint {
+                            lsp_results.sort_by_key(|(_, _, loc)| {
+                                if let lsp_types::OneOf::Left(l) = loc {
+                                    let d_line = (l.range.start.line as i32 - hint.line as i32).abs();
+                                    let d_char = (l.range.start.character as i32 - hint.character as i32).abs();
+                                    d_line * 1000 + d_char
+                                } else {
+                                    i32::MAX
+                                }
+                            });
                         }
                     } else {
                         let query = if let Some(context) = &args.context_hint {
@@ -719,9 +825,10 @@ impl ServerHandler for MyHandler {
 
                 if let Some(lsp) = &self.lsp_client {
                     let mut lsp = lsp.lock().await;
+                    let uri: lsp_types::Uri = Url::from_file_path(&args.symbol_path).unwrap().to_string().parse().unwrap();
                     let lsp_params = lsp_types::DocumentSymbolParams {
                         text_document: lsp_types::TextDocumentIdentifier {
-                            uri: Url::from_file_path(&args.symbol_path).unwrap().to_string().parse().unwrap(),
+                            uri: uri.clone(),
                         },
                         work_done_progress_params: Default::default(),
                         partial_result_params: Default::default(),
@@ -737,12 +844,17 @@ impl ServerHandler for MyHandler {
                     
                     let mut results = Vec::new();
                     if let Some(response) = result {
+                        let path = Url::parse(&uri.to_string()).unwrap().to_file_path().unwrap();
+                        let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+                        let lines: Vec<&str> = content.lines().collect();
+
                         match response {
                             lsp_types::DocumentSymbolResponse::Flat(symbols) => {
                                 for symbol in symbols {
+                                    let signature = lines.get(symbol.location.range.start.line as usize).cloned().map(|l| self.clean_signature(l)).unwrap_or_default();
                                     results.push(models::SymbolMember {
                                         name: format!("{}::{}", args.symbol, symbol.name),
-                                        signature: format!("{:?}", symbol.kind),
+                                        signature,
                                         line: symbol.location.range.start.line,
                                         character: symbol.location.range.start.character,
                                         kind: format!("{:?}", symbol.kind),
@@ -750,7 +862,7 @@ impl ServerHandler for MyHandler {
                                 }
                             }
                             lsp_types::DocumentSymbolResponse::Nested(symbols) => {
-                                self.collect_nested_symbol_members(&symbols, 0, args.level, &mut results);
+                                self.collect_nested_symbol_members(&symbols, 0, args.level, &mut results, &lines);
                                 // Prefix with parent symbol if it's a top-level request
                                 for r in &mut results {
                                     r.name = format!("{}::{}", args.symbol, r.name);
@@ -938,10 +1050,12 @@ impl ServerHandler for MyHandler {
                         self.session_manager.propose_change(&session_id, edit);
                         Ok(CallToolResult {
                             content: vec![ContentBlock::TextContent(TextContent::new(
-                                format!(
-                                    "Rename session started: {}. Workspace edits proposed.",
-                                    session_id
-                                ),
+                                serde_json::to_string(&serde_json::json!({
+                                    "status": "Initiated",
+                                    "sessionId": session_id,
+                                    "message": "Workspace edits proposed and added to session."
+                                }))
+                                .unwrap(),
                                 None,
                                 None,
                             ))],
@@ -1070,6 +1184,27 @@ impl ServerHandler for MyHandler {
                     structured_content: None,
                 })
             }
+            "filesystem_read_file" => {
+                let args: ReadFileArgs = serde_json::from_value(serde_json::Value::Object(
+                    params.arguments.unwrap_or_default(),
+                ))
+                .map_err(|e| CallToolError(Box::new(e)))?;
+                let content = tokio::fs::read_to_string(&args.path).await.map_err(|e| {
+                    CallToolError(Box::new(
+                        RpcError::internal_error().with_message(e.to_string()),
+                    ))
+                })?;
+                Ok(CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent::new(
+                        content,
+                        None,
+                        None,
+                    ))],
+                    is_error: Some(false),
+                    meta: None,
+                    structured_content: None,
+                })
+            }
             _ => Err(CallToolError(Box::new(
                 RpcError::method_not_found()
                     .with_message(format!("Tool {} not found", params.name)),
@@ -1123,8 +1258,17 @@ async fn main() -> Result<()> {
                                         for diag in diagnostics {
                                             if let Some(range) = diag.get("range") {
                                                 let start_line = range["start"]["line"].as_u64().unwrap_or(0) as usize;
+                                                let start_char = range["start"]["character"].as_u64().unwrap_or(0) as usize;
+                                                let end_char = range["end"]["character"].as_u64().unwrap_or(0) as usize;
+                                                
                                                 if start_line < lines.len() {
-                                                    diag["line_content"] = serde_json::json!(lines[start_line]);
+                                                    let line = lines[start_line];
+                                                    diag["line_content"] = serde_json::json!(line);
+                                                    
+                                                    // Try to extract symbol_name
+                                                    if end_char > start_char && end_char <= line.len() {
+                                                        diag["symbol_name"] = serde_json::json!(&line[start_char..end_char]);
+                                                    }
                                                 }
                                             }
                                             diag["path"] = serde_json::json!(path.to_string_lossy());
@@ -1159,7 +1303,12 @@ async fn main() -> Result<()> {
     let options = McpServerOptions {
         server_details: InitializeResult {
             protocol_version: "2024-11-05".to_string(),
-            capabilities: Default::default(),
+            capabilities: rust_mcp_sdk::schema::ServerCapabilities {
+                prompts: Some(rust_mcp_sdk::schema::ServerCapabilitiesPrompts {
+                    list_changed: Some(false),
+                }),
+                ..Default::default()
+            },
             server_info: Implementation {
                 name: "lsp-mcp".into(),
                 version: "1.16".into(),
