@@ -21,12 +21,14 @@ struct LspTestContext {
     lsp_client: Arc<Mutex<lsp::LspClient>>,
     handler: MyHandler,
     main_rs_path: std::path::PathBuf,
+    #[allow(dead_code)]
+    project_path: std::path::PathBuf,
 }
 
 impl LspTestContext {
     async fn setup() -> Self {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let project_path = temp_dir.path();
+        let project_path = temp_dir.path().to_path_buf();
 
         // Create Cargo.toml
         let cargo_toml = r#"[package]
@@ -39,20 +41,29 @@ edition = "2021"
             .unwrap();
 
         // Create src/main.rs
-        let main_rs = r#"fn hello() {
+        let main_rs = r#"mod utils;
+fn hello() {
     println!("hello");
 }
 fn main() {
     let x = 1;
     println!("{}", x);
     hello();
+    utils::useful_func();
 }
 "#;
         tokio::fs::create_dir(project_path.join("src")).await.unwrap();
         let main_rs_path = project_path.join("src/main.rs");
         tokio::fs::write(&main_rs_path, main_rs).await.unwrap();
 
-        let root_uri: lsp_types::Uri = Url::from_directory_path(project_path)
+        // Create src/utils.rs
+        let utils_rs = r#"pub fn useful_func() {
+    println!("useful");
+}
+"#;
+        tokio::fs::write(project_path.join("src/utils.rs"), utils_rs).await.unwrap();
+
+        let root_uri: lsp_types::Uri = Url::from_directory_path(&project_path)
             .unwrap()
             .to_string()
             .parse()
@@ -74,7 +85,7 @@ fn main() {
         .await
         .expect("Failed to start rust-analyzer");
 
-        // Send didOpen
+        // Send didOpen for main.rs
         let content = tokio::fs::read_to_string(&main_rs_path).await.unwrap();
         lsp_client
             .send_notification::<lsp_types::notification::DidOpenTextDocument>(
@@ -101,14 +112,18 @@ fn main() {
             mcp_runtime: Arc::new(Mutex::new(None)),
         };
 
+        // Give rust-analyzer some time to index after didOpen
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
         // Give rust-analyzer some time to initialize and index
-        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
 
         Self {
             temp_dir,
             lsp_client,
             handler,
             main_rs_path,
+            project_path,
         }
     }
 
@@ -136,7 +151,7 @@ async fn test_editor_get_definition() {
     run_lsp_test(|ctx| async move {
         let mut args = serde_json::Map::new();
         args.insert("path".to_string(), serde_json::json!(ctx.main_rs_path_str()));
-        args.insert("line".to_string(), serde_json::json!(5)); // println line
+        args.insert("line".to_string(), serde_json::json!(6)); // println line
         args.insert("character".to_string(), serde_json::json!(20)); // Cursor on 'x'
 
         let params = CallToolRequestParams {
@@ -231,7 +246,7 @@ async fn test_editor_get_references() {
     run_lsp_test(|ctx| async move {
         let mut args = serde_json::Map::new();
         args.insert("path".to_string(), serde_json::json!(ctx.main_rs_path_str()));
-        args.insert("line".to_string(), serde_json::json!(0)); // line 0 is 'fn hello()'
+        args.insert("line".to_string(), serde_json::json!(1)); // line 1 is 'fn hello()'
         args.insert("character".to_string(), serde_json::json!(3)); // inside 'hello'
 
         let params = CallToolRequestParams {
@@ -265,7 +280,7 @@ async fn test_refactor_interactive_rename() {
         symbol_to_find_args.insert("symbolName".to_string(), serde_json::json!("hello"));
         symbol_to_find_args.insert(
             "locationHint".to_string(),
-            serde_json::json!({"line": 0, "character": 3}),
+            serde_json::json!({"line": 1, "character": 3}),
         );
 
         let mut args = serde_json::Map::new();
@@ -372,6 +387,123 @@ async fn test_editor_subscribe_to_diagnostics() {
             .handler
             .subscribed_to_diagnostics
             .load(std::sync::atomic::Ordering::SeqCst));
+        ctx.teardown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_ui_show_workspace_diagnostics() {
+    run_lsp_test(|ctx| async move {
+        let params = CallToolRequestParams {
+            name: "ui_show_workspace_diagnostics".to_string(),
+            arguments: Some(serde_json::Map::new()),
+            meta: None,
+            task: None,
+        };
+        let result = ctx
+            .handler
+            .handle_call_tool_request(params, Arc::new(MockMcpServer::new()))
+            .await
+            .unwrap();
+        
+        if let ContentBlock::TextContent(text) = &result.content[0] {
+            assert!(text.text.contains("opened"));
+        }
+        ctx.teardown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_code_apply_action() {
+    run_lsp_test(|ctx| async move {
+        // Create an action with a workspace edit
+        let mut changes = std::collections::HashMap::new();
+        let uri: lsp_types::Uri = Url::from_file_path(&ctx.main_rs_path)
+            .unwrap()
+            .to_string()
+            .parse()
+            .unwrap();
+        changes.insert(
+            uri,
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                },
+                new_text: "// Leading comment\n".to_string(),
+            }],
+        );
+
+        let edit = lsp_types::WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        };
+
+        let mut action_obj = serde_json::Map::new();
+        action_obj.insert("title".to_string(), serde_json::json!("Add comment"));
+        action_obj.insert("edit".to_string(), serde_json::to_value(edit).unwrap());
+
+        let mut args = serde_json::Map::new();
+        args.insert("actionObject".to_string(), serde_json::Value::Object(action_obj));
+
+        let params = CallToolRequestParams {
+            name: "code_apply_action".to_string(),
+            arguments: Some(args),
+            meta: None,
+            task: None,
+        };
+        let result = ctx
+            .handler
+            .handle_call_tool_request(params, Arc::new(MockMcpServer::new()))
+            .await
+            .unwrap();
+        
+        if let ContentBlock::TextContent(text) = &result.content[0] {
+            assert!(text.text.contains("Applied edit"));
+        }
+
+        // Verify change on disk
+        let content = tokio::fs::read_to_string(&ctx.main_rs_path).await.unwrap();
+        assert!(content.starts_with("// Leading comment"));
+
+        ctx.teardown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_multi_file_find_symbol() {
+    run_lsp_test(|ctx| async move {
+        // Find symbol in another file (utils.rs)
+        let mut args = serde_json::Map::new();
+        args.insert("symbolName".to_string(), serde_json::json!("useful_func"));
+        args.insert("feelingLucky".to_string(), serde_json::json!(true));
+
+        let params = CallToolRequestParams {
+            name: "code_find_symbol".to_string(),
+            arguments: Some(args),
+            meta: None,
+            task: None,
+        };
+        let result = ctx
+            .handler
+            .handle_call_tool_request(params, Arc::new(MockMcpServer::new()))
+            .await
+            .unwrap();
+        if let ContentBlock::TextContent(text) = &result.content[0] {
+            let locations: Vec<models::Location> = serde_json::from_str(&text.text).unwrap();
+            assert!(!locations.is_empty(), "Symbol 'useful_func' not found");
+            assert!(locations[0].path.contains("utils.rs"));
+        }
         ctx.teardown().await;
     })
     .await;
