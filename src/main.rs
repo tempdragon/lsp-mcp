@@ -113,6 +113,17 @@ fn create_tool(name: &str, description: &str, schema: serde_json::Value) -> Tool
 }
 
 impl MyHandler {
+    fn to_absolute_path(path_str: &str) -> std::path::PathBuf {
+        let path = std::path::Path::new(path_str);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(path)
+        }
+    }
+
     fn clean_signature(line: &str) -> String {
         line.trim()
             .trim_end_matches('{')
@@ -482,9 +493,11 @@ impl ServerHandler for MyHandler {
                 .map_err(|e| CallToolError(Box::new(e)))?;
                 if let Some(lsp) = &self.lsp_client {
                     let mut lsp = lsp.lock().await;
+                    let abs_path = Self::to_absolute_path(&args.diagnostic_object.path);
+                    let _ = lsp.ensure_file_open(&abs_path).await;
                     let lsp_params = lsp_types::CodeActionParams {
                         text_document: lsp_types::TextDocumentIdentifier {
-                            uri: Url::from_file_path(&args.diagnostic_object.path)
+                            uri: Url::from_file_path(abs_path)
                                 .unwrap()
                                 .to_string()
                                 .parse()
@@ -613,10 +626,12 @@ impl ServerHandler for MyHandler {
                 .map_err(|e| CallToolError(Box::new(e)))?;
                 if let Some(lsp) = &self.lsp_client {
                     let mut lsp = lsp.lock().await;
+                    let abs_path = Self::to_absolute_path(&args.path);
+                    let _ = lsp.ensure_file_open(&abs_path).await;
                     let lsp_params = lsp_types::GotoDefinitionParams {
                         text_document_position_params: lsp_types::TextDocumentPositionParams {
                             text_document: lsp_types::TextDocumentIdentifier {
-                                uri: Url::from_file_path(&args.path)
+                                uri: Url::from_file_path(abs_path)
                                     .unwrap()
                                     .to_string()
                                     .parse()
@@ -709,10 +724,12 @@ impl ServerHandler for MyHandler {
                 .map_err(|e| CallToolError(Box::new(e)))?;
                 if let Some(lsp) = &self.lsp_client {
                     let mut lsp = lsp.lock().await;
+                    let abs_path = Self::to_absolute_path(&args.path);
+                    let _ = lsp.ensure_file_open(&abs_path).await;
                     let lsp_params = lsp_types::ReferenceParams {
                         text_document_position: lsp_types::TextDocumentPositionParams {
                             text_document: lsp_types::TextDocumentIdentifier {
-                                uri: Url::from_file_path(&args.path)
+                                uri: Url::from_file_path(abs_path)
                                     .unwrap()
                                     .to_string()
                                     .parse()
@@ -957,7 +974,9 @@ impl ServerHandler for MyHandler {
                 .map_err(|e| CallToolError(Box::new(e)))?;
                 if let Some(lsp_client) = &self.lsp_client {
                     let mut lsp = lsp_client.lock().await;
-                    let uri: lsp_types::Uri = Url::from_file_path(&args.symbol_path)
+                    let abs_path = Self::to_absolute_path(&args.symbol_path);
+                    let _ = lsp.ensure_file_open(&abs_path).await;
+                    let uri: lsp_types::Uri = Url::from_file_path(abs_path)
                         .unwrap()
                         .to_string()
                         .parse()
@@ -1037,6 +1056,8 @@ impl ServerHandler for MyHandler {
                 .map_err(|e| CallToolError(Box::new(e)))?;
                 if let Some(lsp_client) = &self.lsp_client {
                     let mut lsp = lsp_client.lock().await;
+                    let abs_path = Self::to_absolute_path(&args.path);
+                    let _ = lsp.ensure_file_open(&abs_path).await;
                     let position =
                         args.symbol_to_find
                             .location_hint
@@ -1048,7 +1069,7 @@ impl ServerHandler for MyHandler {
                     let lsp_params = lsp_types::RenameParams {
                         text_document_position: lsp_types::TextDocumentPositionParams {
                             text_document: lsp_types::TextDocumentIdentifier {
-                                uri: Url::from_file_path(&args.path)
+                                uri: Url::from_file_path(abs_path)
                                     .unwrap()
                                     .to_string()
                                     .parse()
