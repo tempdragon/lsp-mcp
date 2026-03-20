@@ -124,10 +124,12 @@ impl LspClient {
             initialization_options: None,
             capabilities: ClientCapabilities::default(),
             trace: None,
-            workspace_folders: root_uri.map(|uri| vec![lsp_types::WorkspaceFolder {
-                uri: uri.clone(),
-                name: "workspace".to_string(),
-            }]),
+            workspace_folders: root_uri.map(|uri| {
+                vec![lsp_types::WorkspaceFolder {
+                    uri: uri.clone(),
+                    name: "workspace".to_string(),
+                }]
+            }),
             client_info: None,
             locale: None,
             work_done_progress_params: Default::default(),
@@ -148,7 +150,8 @@ impl LspClient {
 
     #[allow(dead_code)]
     pub async fn shutdown(&mut self) -> Result<()> {
-        self.send_request::<lsp_types::request::Shutdown>(()).await?;
+        self.send_request::<lsp_types::request::Shutdown>(())
+            .await?;
         self.send_notification::<lsp_types::notification::Exit>(())
             .await?;
 
@@ -212,7 +215,7 @@ impl LspClient {
 
         let content = tokio::fs::read_to_string(path).await?;
         let uri = Url::from_file_path(path).map_err(|_| anyhow!("Invalid file path"))?;
-        
+
         // Prepare the notification manually because we can't easily use send_notification with generic N here if we want a &self method
         let params = lsp_types::DidOpenTextDocumentParams {
             text_document: lsp_types::TextDocumentItem {
@@ -222,7 +225,7 @@ impl LspClient {
                 text: content,
             },
         };
-        
+
         let request = json!({
             "jsonrpc": "2.0",
             "method": lsp_types::notification::DidOpenTextDocument::METHOD,
@@ -243,25 +246,31 @@ impl LspClient {
         params: N::Params,
     ) -> Result<()> {
         let method = N::METHOD;
-        
+
         // Track opened/closed files to prevent duplicates
         if method == lsp_types::notification::DidOpenTextDocument::METHOD {
             let json_params = serde_json::to_value(&params)?;
-            if let Some(uri) = json_params.get("textDocument").and_then(|d| d.get("uri")).and_then(|u| u.as_str()) {
-                if let Ok(url) = url::Url::parse(uri) {
-                    if let Ok(path) = url.to_file_path() {
-                        self.opened_files.insert(path.to_string_lossy().to_string(), 0);
-                    }
-                }
+            if let Some(uri) = json_params
+                .get("textDocument")
+                .and_then(|d| d.get("uri"))
+                .and_then(|u| u.as_str())
+                && let Ok(url) = url::Url::parse(uri)
+                && let Ok(path) = url.to_file_path()
+            {
+                self.opened_files
+                    .insert(path.to_string_lossy().to_string(), 0);
             }
         } else if method == lsp_types::notification::DidCloseTextDocument::METHOD {
             let json_params = serde_json::to_value(&params)?;
-            if let Some(uri) = json_params.get("textDocument").and_then(|d| d.get("uri")).and_then(|u| u.as_str()) {
-                if let Ok(url) = url::Url::parse(uri) {
-                    if let Ok(path) = url.to_file_path() {
-                        self.opened_files.remove(&path.to_string_lossy().to_string());
-                    }
-                }
+            if let Some(uri) = json_params
+                .get("textDocument")
+                .and_then(|d| d.get("uri"))
+                .and_then(|u| u.as_str())
+                && let Ok(url) = url::Url::parse(uri)
+                && let Ok(path) = url.to_file_path()
+            {
+                self.opened_files
+                    .remove(&path.to_string_lossy().to_string());
             }
         }
 

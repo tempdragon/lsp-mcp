@@ -1,6 +1,6 @@
 mod lsp;
-mod models;
 mod mock_server;
+mod models;
 
 #[cfg(test)]
 mod tests;
@@ -78,6 +78,14 @@ struct ReadFileArgs {
     path: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct GetCompletionsArgs {
+    path: String,
+    line: u32,
+    character: u32,
+}
+
 fn default_hover_detail() -> String {
     "signature".to_string()
 }
@@ -118,9 +126,7 @@ impl MyHandler {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join(path)
+            std::env::current_dir().unwrap_or_default().join(path)
         }
     }
 
@@ -184,7 +190,8 @@ impl MyHandler {
                 kind: format!("{:?}", s.kind),
             });
             if current_level + 1 < max_level
-                && let Some(children) = &s.children {
+                && let Some(children) = &s.children
+            {
                 Self::collect_nested_symbol_members(
                     children,
                     current_level + 1,
@@ -193,6 +200,47 @@ impl MyHandler {
                     lines,
                 );
             }
+        }
+    }
+
+    fn enrich_diagnostics(
+        diagnostics: &mut Vec<serde_json::Value>,
+        lines: &[&str],
+        doc_symbols: &[(String, lsp_types::Range)],
+        path: &std::path::Path,
+    ) {
+        for diag in diagnostics {
+            if let Some(range) = diag.get("range") {
+                let start_line = range["start"]["line"].as_u64().unwrap_or(0) as usize;
+                let start_char = range["start"]["character"].as_u64().unwrap_or(0) as usize;
+                let end_char = range["end"]["character"].as_u64().unwrap_or(0) as usize;
+
+                if start_line < lines.len() {
+                    let line = lines[start_line];
+                    diag["line_content"] = serde_json::json!(line);
+                    let diag_range: lsp_types::Range =
+                        serde_json::from_value(diag["range"].clone()).unwrap_or_default();
+                    let semantic_name = doc_symbols
+                        .iter()
+                        .find(|(_, r)| {
+                            r.start.line <= diag_range.start.line
+                                && r.end.line >= diag_range.end.line
+                                && (r.start.line != diag_range.start.line
+                                    || r.start.character <= diag_range.start.character)
+                                && (r.end.line != diag_range.end.line
+                                    || r.end.character >= diag_range.end.character)
+                        })
+                        .map(|(n, _)| n.clone());
+                    if let Some(name) = semantic_name {
+                        diag["symbol_name"] = serde_json::json!(name);
+                        diag["symbol_name_source"] = serde_json::json!("semantic");
+                    } else if end_char > start_char && end_char <= line.len() {
+                        diag["symbol_name"] = serde_json::json!(&line[start_char..end_char]);
+                        diag["symbol_name_source"] = serde_json::json!("textual");
+                    }
+                }
+            }
+            diag["path"] = serde_json::json!(path.to_string_lossy());
         }
     }
 
@@ -438,8 +486,13 @@ impl ServerHandler for MyHandler {
             ),
             create_tool(
                 "code_show_sub_symbol",
-                "Shows members of a symbol.",
+                "Shows the methods or attributes within a symbol.",
                 serde_json::to_value(schemars::schema_for!(ShowSubSymbolArgs)).unwrap(),
+            ),
+            create_tool(
+                "code_get_completions",
+                "Retrieves suggested code completions at a cursor position.",
+                serde_json::to_value(schemars::schema_for!(GetCompletionsArgs)).unwrap(),
             ),
             create_tool(
                 "refactor_interactive_rename",
@@ -1116,6 +1169,80 @@ impl ServerHandler for MyHandler {
                     )))
                 }
             }
+            "code_get_completions" => {
+                let args: GetCompletionsArgs = serde_json::from_value(serde_json::Value::Object(
+                    params.arguments.unwrap_or_default(),
+                ))
+                .map_err(|e| CallToolError(Box::new(e)))?;
+                if let Some(lsp_client) = &self.lsp_client {
+                    let mut lsp = lsp_client.lock().await;
+                    let abs_path = Self::to_absolute_path(&args.path);
+                    let _ = lsp.ensure_file_open(&abs_path).await;
+                    let lsp_params = lsp_types::CompletionParams {
+                        text_document_position: lsp_types::TextDocumentPositionParams {
+                            text_document: lsp_types::TextDocumentIdentifier {
+                                uri: Url::from_file_path(abs_path)
+                                    .unwrap()
+                                    .to_string()
+                                    .parse()
+                                    .unwrap(),
+                            },
+                            position: lsp_types::Position {
+                                line: args.line,
+                                character: args.character,
+                            },
+                        },
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                        context: None,
+                    };
+                    let result = lsp
+                        .send_request::<lsp_types::request::Completion>(lsp_params)
+                        .await
+                        .map_err(|e| {
+                            CallToolError(Box::new(
+                                RpcError::internal_error().with_message(e.to_string()),
+                            ))
+                        })?;
+
+                    let mut results = Vec::new();
+                    if let Some(response) = result {
+                        let items = match response {
+                            lsp_types::CompletionResponse::Array(items) => items,
+                            lsp_types::CompletionResponse::List(list) => list.items,
+                        };
+                        for item in items {
+                            results.push(models::CompletionItem {
+                                label: item.label,
+                                kind: item.kind.map(|k| format!("{:?}", k)),
+                                detail: item.detail,
+                                documentation: item.documentation.map(|d| match d {
+                                    lsp_types::Documentation::String(s) => s,
+                                    lsp_types::Documentation::MarkupContent(m) => m.value,
+                                }),
+                                sort_text: item.sort_text,
+                                filter_text: item.filter_text,
+                                insert_text: item.insert_text,
+                            });
+                        }
+                    }
+
+                    Ok(CallToolResult {
+                        content: vec![ContentBlock::TextContent(TextContent::new(
+                            serde_json::to_string(&results).unwrap(),
+                            None,
+                            None,
+                        ))],
+                        is_error: Some(false),
+                        meta: None,
+                        structured_content: None,
+                    })
+                } else {
+                    Err(CallToolError(Box::new(
+                        RpcError::internal_error().with_message("LSP not available".to_string()),
+                    )))
+                }
+            }
             "ui_show_workspace_diagnostics" => {
                 let runtime = self.mcp_runtime.lock().await;
                 if let Some(runtime) = runtime.as_ref() {
@@ -1198,13 +1325,14 @@ async fn main() -> Result<()> {
     let root_uri: Option<lsp_types::Uri> = Url::from_directory_path(&current_dir)
         .ok()
         .map(|u| u.to_string().parse().unwrap());
-    let lsp_client = match lsp::LspClient::start("rust-analyzer", &[], notification_tx, root_uri).await {
-        Ok(client) => Some(Arc::new(Mutex::new(client))),
-        Err(e) => {
-            eprintln!("Warning: Could not start rust-analyzer: {}", e);
-            None
-        }
-    };
+    let lsp_client =
+        match lsp::LspClient::start("rust-analyzer", &[], notification_tx, root_uri).await {
+            Ok(client) => Some(Arc::new(Mutex::new(client))),
+            Err(e) => {
+                eprintln!("Warning: Could not start rust-analyzer: {}", e);
+                None
+            }
+        };
     let mcp_runtime: Arc<Mutex<Option<Arc<dyn McpServer>>>> = Arc::new(Mutex::new(None));
     let handler = MyHandler {
         lsp_client: lsp_client.clone(),
@@ -1214,9 +1342,18 @@ async fn main() -> Result<()> {
 
     if cli.manual {
         if let Some(tool_name) = cli.call {
-            let arguments: Option<serde_json::Map<String, serde_json::Value>> = cli.args.as_ref().and_then(|a| serde_json::from_str(a).ok());
-            let params = CallToolRequestParams { name: tool_name, arguments, meta: None, task: None };
-            match handler.handle_call_tool_request(params, Arc::new(mock_server::MockMcpServer::new())).await {
+            let arguments: Option<serde_json::Map<String, serde_json::Value>> =
+                cli.args.as_ref().and_then(|a| serde_json::from_str(a).ok());
+            let params = CallToolRequestParams {
+                name: tool_name,
+                arguments,
+                meta: None,
+                task: None,
+            };
+            match handler
+                .handle_call_tool_request(params, Arc::new(mock_server::MockMcpServer::new()))
+                .await
+            {
                 Ok(res) => println!("{}", serde_json::to_string_pretty(&res).unwrap()),
                 Err(e) => {
                     eprintln!("Error: {:?}", e);
@@ -1230,16 +1367,32 @@ async fn main() -> Result<()> {
         let mut lines = std::io::stdin().lines();
         while let Some(Ok(line)) = lines.next() {
             let line = line.trim();
-            if line == "exit" || line == "quit" { break; }
+            if line == "exit" || line == "quit" {
+                break;
+            }
             if line == "help" {
-                let tools = handler.handle_list_tools_request(None, Arc::new(mock_server::MockMcpServer::new())).await.unwrap();
-                for t in tools.tools { eprintln!("- {}: {}", t.name, t.description.unwrap_or_default()); }
+                let tools = handler
+                    .handle_list_tools_request(None, Arc::new(mock_server::MockMcpServer::new()))
+                    .await
+                    .unwrap();
+                for t in tools.tools {
+                    eprintln!("- {}: {}", t.name, t.description.unwrap_or_default());
+                }
                 continue;
             }
             if let Some((name, json_args)) = line.split_once(' ') {
-                let arguments: Option<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(json_args).ok();
-                let params = CallToolRequestParams { name: name.to_string(), arguments, meta: None, task: None };
-                match handler.handle_call_tool_request(params, Arc::new(mock_server::MockMcpServer::new())).await {
+                let arguments: Option<serde_json::Map<String, serde_json::Value>> =
+                    serde_json::from_str(json_args).ok();
+                let params = CallToolRequestParams {
+                    name: name.to_string(),
+                    arguments,
+                    meta: None,
+                    task: None,
+                };
+                match handler
+                    .handle_call_tool_request(params, Arc::new(mock_server::MockMcpServer::new()))
+                    .await
+                {
                     Ok(res) => println!("{}", serde_json::to_string_pretty(&res).unwrap()),
                     Err(e) => eprintln!("Error: {:?}", e),
                 }
@@ -1265,8 +1418,7 @@ async fn main() -> Result<()> {
                 if let (Some(uri_str), Some(diagnostics)) = (
                     uri_str,
                     params.get_mut("diagnostics").and_then(|d| d.as_array_mut()),
-                )
-                    && let Ok(url) = Url::parse(&uri_str)
+                ) && let Ok(url) = Url::parse(&uri_str)
                     && let Ok(path) = url.to_file_path()
                     && let Ok(content) = tokio::fs::read_to_string(&path).await
                 {
@@ -1310,41 +1462,7 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    for diag in diagnostics {
-                        if let Some(range) = diag.get("range") {
-                            let start_line = range["start"]["line"].as_u64().unwrap_or(0) as usize;
-                            let start_char =
-                                range["start"]["character"].as_u64().unwrap_or(0) as usize;
-                            let end_char = range["end"]["character"].as_u64().unwrap_or(0) as usize;
-
-                            if start_line < lines.len() {
-                                let line = lines[start_line];
-                                diag["line_content"] = serde_json::json!(line);
-                                let diag_range: lsp_types::Range =
-                                    serde_json::from_value(diag["range"].clone()).unwrap();
-                                let semantic_name = doc_symbols
-                                    .iter()
-                                    .find(|(_, r)| {
-                                        r.start.line <= diag_range.start.line
-                                            && r.end.line >= diag_range.end.line
-                                            && (r.start.line != diag_range.start.line
-                                                || r.start.character <= diag_range.start.character)
-                                            && (r.end.line != diag_range.end.line
-                                                || r.end.character >= diag_range.end.character)
-                                    })
-                                    .map(|(n, _)| n.clone());
-                                if let Some(name) = semantic_name {
-                                    diag["symbol_name"] = serde_json::json!(name);
-                                    diag["symbol_name_source"] = serde_json::json!("semantic");
-                                } else if end_char > start_char && end_char <= line.len() {
-                                    diag["symbol_name"] =
-                                        serde_json::json!(&line[start_char..end_char]);
-                                    diag["symbol_name_source"] = serde_json::json!("textual");
-                                }
-                            }
-                        }
-                        diag["path"] = serde_json::json!(path.to_string_lossy());
-                    }
+                    MyHandler::enrich_diagnostics(diagnostics, &lines, &doc_symbols, &path);
                 }
 
                 let runtime = runtime_for_notifications.lock().await;

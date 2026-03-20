@@ -44,3 +44,15 @@ pub struct SymbolMember {
     pub character: u32,
     pub kind: String,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionItem {
+    pub label: String,
+    pub kind: Option<String>,
+    pub detail: Option<String>,
+    pub documentation: Option<String>,
+    pub sort_text: Option<String>,
+    pub filter_text: Option<String>,
+    pub insert_text: Option<String>,
+}
