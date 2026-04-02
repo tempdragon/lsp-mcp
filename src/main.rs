@@ -28,12 +28,18 @@ use url::Url;
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct FindSymbolArgs {
+    /// The name of the symbol to find (e.g., a function or class name).
     symbol_name: String,
+    /// A full or partial path to a file to search within. If omitted, the search is performed across the entire workspace.
     file: Option<String>,
+    /// A `{line, character}` object providing a best-guess location. (Note: All position values are 0-based.)
     location_hint: Option<models::Position>,
+    /// A natural language description of the symbol's context.
     context_hint: Option<String>,
+    /// Determines if hover info is included. Can be "none", "signature", or "full".
     #[serde(default = "default_hover_detail")]
     hover_detail: String,
+    /// If True, the tool returns the single best match. If False and the result is ambiguous, it returns a list of choices.
     #[serde(default = "default_true")]
     feeling_lucky: bool,
 }
@@ -41,16 +47,22 @@ struct FindSymbolArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct PathLineCharArgs {
+    /// The absolute path to the file.
     path: String,
+    /// The 0-based line number.
     line: u32,
+    /// The 0-based character offset.
     character: u32,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct ShowSubSymbolArgs {
+    /// The name of the symbol to inspect (e.g., a class name).
     symbol: String,
+    /// The path to the file containing the symbol.
     symbol_path: String,
+    /// The depth of the symbol hierarchy to explore. A level of 1 shows only the direct children of the symbol. A level of 2 or more will show nested symbols.
     #[serde(default = "default_one")]
     level: u32,
 }
@@ -58,34 +70,43 @@ struct ShowSubSymbolArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct GetActionsArgs {
+    /// The full, enriched diagnostic object. (Note: The range within this object uses 0-based indexing.)
     diagnostic_object: models::EnrichedDiagnostic,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct ApplyActionArgs {
+    /// The specific action object to execute, as returned by code_get_actions_for_diagnostic.
     action_object: models::CodeAction,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct InteractiveRenameArgs {
+    /// The path to a file containing an instance of the symbol.
     path: String,
+    /// An object containing the symbolName and a locationHint or contextHint to identify the symbol to rename. (Note: All position values are 0-based.)
     symbol_to_find: FindSymbolArgs,
+    /// The new name for the symbol.
     new_name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct ReadFileArgs {
+    /// The absolute path to the file to read.
     path: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct GetCompletionsArgs {
+    /// The absolute or relative path to the file.
     path: String,
+    /// The 0-based line number.
     line: u32,
+    /// The 0-based character offset.
     character: u32,
 }
 
@@ -389,17 +410,22 @@ impl MyHandler {
 
 #[tool_router]
 impl MyHandler {
-    #[tool(description = "Subscribes to proactive diagnostic notifications.")]
+    #[tool(
+        description = "Subscribes the AI to receive proactive notifications of diagnostics. When a new error appears, the system will send an Enriched Diagnostic Object that can be used with other tools."
+    )]
     async fn editor_subscribe_to_diagnostics(&self) -> String {
         self.subscribed_to_diagnostics.store(true, Ordering::SeqCst);
         serde_json::to_string(&serde_json::json!({
             "status": "Subscribed",
             "range": { "start": { "line": 0, "character": 0 }, "end": { "line": u32::MAX, "character": u32::MAX } },
             "scope": "workspace"
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
-    #[tool(description = "Fetches potential Code Actions for a diagnostic.")]
+    #[tool(
+        description = "For a given diagnostic object, this tool fetches a list of potential 'Code Actions' or 'Quick Fixes' that the Language Server recommends."
+    )]
     async fn code_get_actions_for_diagnostic(
         &self,
         Parameters(args): Parameters<GetActionsArgs>,
@@ -438,7 +464,9 @@ impl MyHandler {
         }
     }
 
-    #[tool(description = "Applies a specific Code Action.")]
+    #[tool(
+        description = "Applies a specific Code Action chosen from the list provided by code_get_actions_for_diagnostic. This tool executes the change directly to the codebase."
+    )]
     async fn code_apply_action(
         &self,
         Parameters(args): Parameters<ApplyActionArgs>,
@@ -481,7 +509,9 @@ impl MyHandler {
         }
     }
 
-    #[tool(description = "Finds the definition of a symbol.")]
+    #[tool(
+        description = "Finds the definition of the symbol at a specific cursor position. Use this to navigate directly to its source to understand what it does."
+    )]
     async fn editor_get_definition(
         &self,
         Parameters(args): Parameters<PathLineCharArgs>,
@@ -565,7 +595,9 @@ impl MyHandler {
         }
     }
 
-    #[tool(description = "Finds all references to a symbol.")]
+    #[tool(
+        description = "Finds all references to the symbol at a specific cursor position throughout the workspace. Use this for critical impact analysis before proposing changes."
+    )]
     async fn editor_get_references(
         &self,
         Parameters(args): Parameters<PathLineCharArgs>,
@@ -620,7 +652,9 @@ impl MyHandler {
         }
     }
 
-    #[tool(description = "Locates symbols and retrieves information.")]
+    #[tool(
+        description = "A powerful, unified tool for locating symbols and retrieving their information. It can search within a specific file or across the entire workspace. Use this as your canonical tool for finding code."
+    )]
     async fn code_find_symbol(
         &self,
         Parameters(args): Parameters<FindSymbolArgs>,
@@ -787,7 +821,9 @@ impl MyHandler {
         }
     }
 
-    #[tool(description = "Shows the methods or attributes within a symbol.")]
+    #[tool(
+        description = "Shows the methods, attributes, or functions defined within a given module, class, or other symbol. Use this to understand the internal structure without reading the entire body."
+    )]
     async fn code_show_sub_symbol(
         &self,
         Parameters(args): Parameters<ShowSubSymbolArgs>,
@@ -855,7 +891,9 @@ impl MyHandler {
         }
     }
 
-    #[tool(description = "Retrieves suggested code completions at a cursor position.")]
+    #[tool(
+        description = "Retrieves a list of suggested code completions at a specific cursor position. Use this when completing partial names or exploring available members."
+    )]
     async fn code_get_completions(
         &self,
         Parameters(args): Parameters<GetCompletionsArgs>,
@@ -914,7 +952,9 @@ impl MyHandler {
         }
     }
 
-    #[tool(description = "Initiates a workspace-wide rename.")]
+    #[tool(
+        description = "Initiates a safe, workspace-wide rename of a symbol. This handles finding the symbol, getting all references, and applying changes autonomously."
+    )]
     async fn refactor_interactive_rename(
         &self,
         Parameters(args): Parameters<InteractiveRenameArgs>,
@@ -968,7 +1008,9 @@ impl MyHandler {
         }
     }
 
-    #[tool(description = "Opens the workspace diagnostics UI.")]
+    #[tool(
+        description = "Commands the LSP to display all diagnostics (errors and warnings) for the entire workspace to the AI."
+    )]
     async fn ui_show_workspace_diagnostics(
         &self,
         _context: RequestContext<RoleServer>,
@@ -984,7 +1026,9 @@ impl MyHandler {
         Ok("Workspace diagnostics UI opened".to_string())
     }
 
-    #[tool(description = "Reads the content of a file from the filesystem.")]
+    #[tool(
+        description = "Reads the content of a file from the filesystem. Use this to verify the outcome of a file-writing operation (Doctrine 2)."
+    )]
     async fn filesystem_read_file(
         &self,
         Parameters(args): Parameters<ReadFileArgs>,
@@ -1087,7 +1131,7 @@ async fn main() -> Result<()> {
     let handler = MyHandler::new(lsp_client.clone());
 
     if cli.manual {
-        let peer = mock_server::dummy_peer(handler.clone());
+        let peer = mock_server::dummy_peer(handler.clone()).await;
         if let Some(tool_name) = cli.call {
             let arguments: Option<serde_json::Map<String, serde_json::Value>> =
                 cli.args.as_ref().and_then(|a| serde_json::from_str(a).ok());

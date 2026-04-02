@@ -14,6 +14,7 @@ struct LspTestContext {
     handler: MyHandler,
     main_rs_path: std::path::PathBuf,
     project_path: std::path::PathBuf,
+    peer: rmcp::service::Peer<rmcp::RoleServer>,
 }
 
 impl LspTestContext {
@@ -102,6 +103,7 @@ fn main() {
 
         let lsp_client = Arc::new(Mutex::new(lsp_client));
         let handler = MyHandler::new(Some(lsp_client.clone()));
+        let peer = mock_server::dummy_peer(handler.clone()).await;
 
         // Give rust-analyzer some time to index after didOpen
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -115,6 +117,7 @@ fn main() {
             handler,
             main_rs_path,
             project_path,
+            peer,
         }
     }
 
@@ -148,15 +151,18 @@ async fn test_editor_get_definition() {
         args.insert("line".to_string(), serde_json::json!(6)); // println line
         args.insert("character".to_string(), serde_json::json!(20)); // Cursor on 'x'
 
-        let mut params = CallToolRequestParams::new("editor_get_definition");
+        let mut params = CallToolRequestParams::new("editor_get_definition".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             let locations: Vec<models::Location> = serde_json::from_str(&text.text).unwrap();
             assert!(!locations.is_empty(), "Definition not found for 'x'");
             assert!(locations[0].path.contains("main.rs"));
@@ -177,15 +183,18 @@ async fn test_code_show_sub_symbol() {
         );
         args.insert("level".to_string(), serde_json::json!(1));
 
-        let mut params = CallToolRequestParams::new("code_show_sub_symbol");
+        let mut params = CallToolRequestParams::new("code_show_sub_symbol".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             let members: Vec<models::SymbolMember> = serde_json::from_str(&text.text).unwrap();
             assert!(
                 members.iter().any(|m| m.name.contains("main")),
@@ -208,15 +217,18 @@ async fn test_code_find_symbol() {
         args.insert("symbolName".to_string(), serde_json::json!("hello"));
         args.insert("feelingLucky".to_string(), serde_json::json!(true));
 
-        let mut params = CallToolRequestParams::new("code_find_symbol");
+        let mut params = CallToolRequestParams::new("code_find_symbol".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             let locations: Vec<models::Location> = serde_json::from_str(&text.text).unwrap();
             assert!(
                 !locations.is_empty(),
@@ -240,15 +252,18 @@ async fn test_code_get_completions() {
         args.insert("line".to_string(), serde_json::json!(9)); // line with utils::
         args.insert("character".to_string(), serde_json::json!(11)); // Position at "utils::"
 
-        let mut params = CallToolRequestParams::new("code_get_completions");
+        let mut params = CallToolRequestParams::new("code_get_completions".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             let completions: Vec<models::CompletionItem> =
                 serde_json::from_str(&text.text).unwrap();
             assert!(!completions.is_empty(), "Completions not found at utils::");
@@ -273,15 +288,18 @@ async fn test_editor_get_references() {
         args.insert("line".to_string(), serde_json::json!(1)); // line 1 is 'fn hello()'
         args.insert("character".to_string(), serde_json::json!(3)); // inside 'hello'
 
-        let mut params = CallToolRequestParams::new("editor_get_references");
+        let mut params = CallToolRequestParams::new("editor_get_references".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             let locations: Vec<models::Location> = serde_json::from_str(&text.text).unwrap();
             assert!(
                 locations.len() >= 2,
@@ -315,15 +333,18 @@ async fn test_refactor_interactive_rename() {
         );
         args.insert("newName".to_string(), serde_json::json!("greet"));
 
-        let mut params = CallToolRequestParams::new("refactor_interactive_rename");
+        let mut params = CallToolRequestParams::new("refactor_interactive_rename".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             assert!(
                 text.text.contains("Applied"),
                 "Rename failed: {}",
@@ -373,12 +394,15 @@ async fn test_code_get_actions_for_diagnostic() {
             serde_json::Value::Object(diag_obj),
         );
 
-        let mut params = CallToolRequestParams::new("code_get_actions_for_diagnostic");
+        let mut params = CallToolRequestParams::new("code_get_actions_for_diagnostic".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
@@ -390,16 +414,19 @@ async fn test_code_get_actions_for_diagnostic() {
 #[tokio::test]
 async fn test_editor_subscribe_to_diagnostics() {
     run_lsp_test(|ctx| async move {
-        let mut params = CallToolRequestParams::new("editor_subscribe_to_diagnostics");
+        let mut params = CallToolRequestParams::new("editor_subscribe_to_diagnostics".to_string());
         params.arguments = Some(serde_json::Map::new().into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
 
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             assert!(text.text.contains("Subscribed"));
         }
         assert!(
@@ -415,16 +442,19 @@ async fn test_editor_subscribe_to_diagnostics() {
 #[tokio::test]
 async fn test_ui_show_workspace_diagnostics() {
     run_lsp_test(|ctx| async move {
-        let mut params = CallToolRequestParams::new("ui_show_workspace_diagnostics");
+        let mut params = CallToolRequestParams::new("ui_show_workspace_diagnostics".to_string());
         params.arguments = Some(serde_json::Map::new().into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
 
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             assert!(text.text.contains("opened"));
         }
         ctx.teardown().await;
@@ -475,16 +505,19 @@ async fn test_code_apply_action() {
             serde_json::Value::Object(action_obj),
         );
 
-        let mut params = CallToolRequestParams::new("code_apply_action");
+        let mut params = CallToolRequestParams::new("code_apply_action".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
 
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             assert!(text.text.contains("Applied edit"));
         }
 
@@ -505,15 +538,18 @@ async fn test_multi_file_find_symbol() {
         args.insert("symbolName".to_string(), serde_json::json!("useful_func"));
         args.insert("feelingLucky".to_string(), serde_json::json!(true));
 
-        let mut params = CallToolRequestParams::new("code_find_symbol");
+        let mut params = CallToolRequestParams::new("code_find_symbol".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             let locations: Vec<models::Location> = serde_json::from_str(&text.text).unwrap();
             assert!(!locations.is_empty(), "Symbol 'useful_func' not found");
             assert!(locations[0].path.contains("utils.rs"));
@@ -534,13 +570,16 @@ async fn test_zero_based_boundary() {
         args.insert("line".to_string(), serde_json::json!(0));
         args.insert("character".to_string(), serde_json::json!(0));
 
-        let mut params = CallToolRequestParams::new("editor_get_definition");
+        let mut params = CallToolRequestParams::new("editor_get_definition".to_string());
         params.arguments = Some(args.into_iter().collect());
+
         // Should find 'mod utils' or similar at 0,0
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
@@ -559,15 +598,18 @@ async fn test_negative_find_symbol() {
         );
         args.insert("feelingLucky".to_string(), serde_json::json!(true));
 
-        let mut params = CallToolRequestParams::new("code_find_symbol");
+        let mut params = CallToolRequestParams::new("code_find_symbol".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             let locations: Vec<models::Location> = serde_json::from_str(&text.text).unwrap();
             assert!(locations.is_empty());
         }
@@ -592,15 +634,18 @@ pub fn useful_func() { println!("useful"); }
         args.insert("symbolName".to_string(), serde_json::json!("hello"));
         args.insert("feelingLucky".to_string(), serde_json::json!(false)); // Expect multiple
 
-        let mut params = CallToolRequestParams::new("code_find_symbol");
+        let mut params = CallToolRequestParams::new("code_find_symbol".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             let locations: Vec<models::Location> = serde_json::from_str(&text.text).unwrap();
             assert!(
                 locations.len() >= 2,
@@ -624,15 +669,18 @@ async fn test_negative_get_definition_whitespace() {
         args.insert("line".to_string(), serde_json::json!(10)); // Empty line
         args.insert("character".to_string(), serde_json::json!(0));
 
-        let mut params = CallToolRequestParams::new("editor_get_definition");
+        let mut params = CallToolRequestParams::new("editor_get_definition".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             let locations: Vec<models::Location> = serde_json::from_str(&text.text).unwrap();
             assert!(
                 locations.is_empty(),
@@ -696,12 +744,15 @@ async fn test_doctrine_workflow() {
             "diagnosticObject".to_string(),
             serde_json::Value::Object(diag_obj),
         );
-        let mut params = CallToolRequestParams::new("code_get_actions_for_diagnostic");
+        let mut params = CallToolRequestParams::new("code_get_actions_for_diagnostic".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
 
@@ -723,12 +774,15 @@ async fn test_negative_show_sub_symbol_malformed_path() {
             serde_json::json!("/non/existent/path.rs"),
         );
 
-        let mut params = CallToolRequestParams::new("code_show_sub_symbol");
+        let mut params = CallToolRequestParams::new("code_show_sub_symbol".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await;
         assert!(result.is_err(), "Expected error for non-existent path");
         ctx.teardown().await;
@@ -760,21 +814,23 @@ async fn test_negative_rename_non_existent() {
         );
         args.insert("newName".to_string(), serde_json::json!("fail"));
 
-        let mut params = CallToolRequestParams::new("refactor_interactive_rename");
+        let mut params = CallToolRequestParams::new("refactor_interactive_rename".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await;
         // Rename might "succeed" with 0 edits or return error depending on LSP.
         // If it returns success with "LSP returned no edits", that's also a valid outcome in our current code.
         if let Ok(res) = result {
-            if let RawContent::Text(annotated_text) = &res.content[0].raw {
-                let text = &annotated_text.text;
+            if let RawContent::Text(text) = &*res.content[0] {
                 assert!(
-                    text.contains("no edits")
-                        || text.contains("failed")
+                    text.text.contains("no edits")
+                        || text.text.contains("failed")
                         || res.is_error.unwrap_or(false)
                 );
             }
@@ -798,16 +854,19 @@ async fn test_filesystem_read_file() {
             serde_json::json!(temp_file.to_string_lossy()),
         );
 
-        let mut params = CallToolRequestParams::new("filesystem_read_file");
+        let mut params = CallToolRequestParams::new("filesystem_read_file".to_string());
         params.arguments = Some(args.into_iter().collect());
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
+
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await
             .unwrap();
 
-        if let RawContent::Text(text) = &result.content[0].raw {
+        if let RawContent::Text(text) = &*result.content[0] {
             assert_eq!(text.text, "mcp test content");
         }
         ctx.teardown().await;
@@ -819,12 +878,11 @@ async fn test_filesystem_read_file() {
 async fn test_mcp_prompts_dynamic_guidance() {
     run_lsp_test(|ctx| async move {
         // 1. Test List Prompts
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
         let list_result = ctx
             .handler
             .list_prompts(
                 None,
-                RequestContext::new(RequestId::Number(0), peer.clone()),
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
             )
             .await
             .unwrap();
@@ -842,18 +900,18 @@ async fn test_mcp_prompts_dynamic_guidance() {
             serde_json::Value::String("Why is my test failing?".to_string()),
         );
 
-        let mut params = GetPromptRequestParams::new("dynamic_guidance");
+        let mut params = GetPromptRequestParams::new("dynamic_guidance".to_string());
         params.arguments = Some(args.into_iter().collect());
 
         let prompt_result = ctx
             .handler
             .get_prompt(
                 params,
-                RequestContext::new(RequestId::Number(0), peer.clone()),
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
             )
             .await
             .unwrap();
-        if let PromptMessageContent::Text { text, .. } = &prompt_result.messages[0].content {
+        if let PromptMessageContent::Text { text } = &prompt_result.messages[0].content {
             assert!(text.contains("To debug a failing test"));
         }
 
@@ -864,18 +922,18 @@ async fn test_mcp_prompts_dynamic_guidance() {
             serde_json::Value::String("Variable not found error".to_string()),
         );
 
-        let mut params = GetPromptRequestParams::new("dynamic_guidance");
+        let mut params = GetPromptRequestParams::new("dynamic_guidance".to_string());
         params.arguments = Some(args.into_iter().collect());
 
         let prompt_result = ctx
             .handler
             .get_prompt(
                 params,
-                RequestContext::new(RequestId::Number(0), peer.clone()),
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
             )
             .await
             .unwrap();
-        if let PromptMessageContent::Text { text, .. } = &prompt_result.messages[0].content {
+        if let PromptMessageContent::Text { text } = &prompt_result.messages[0].content {
             assert!(text.contains("use code_find_symbol"));
         }
         ctx.teardown().await;
@@ -924,13 +982,15 @@ async fn test_code_apply_action_command() {
             serde_json::Value::Object(action_obj),
         );
 
-        let mut params = CallToolRequestParams::new("code_apply_action");
+        let mut params = CallToolRequestParams::new("code_apply_action".to_string());
         params.arguments = Some(args.into_iter().collect());
 
-        let peer = mock_server::dummy_peer(ctx.handler.clone());
         let result = ctx
             .handler
-            .call_tool(params, RequestContext::new(RequestId::Number(0), peer))
+            .call_tool(
+                params,
+                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+            )
             .await;
 
         // If it's a real rust-analyzer, it might fail with "unknown command" or similar,
