@@ -1350,15 +1350,20 @@ async fn main() -> Result<()> {
                 meta: None,
                 task: None,
             };
-            match handler
-                .handle_call_tool_request(params, Arc::new(mock_server::MockMcpServer::new()))
-                .await
-            {
+            match handler.handle_call_tool_request(params, Arc::new(mock_server::MockMcpServer::new())).await {
                 Ok(res) => println!("{}", serde_json::to_string_pretty(&res).unwrap()),
                 Err(e) => {
                     eprintln!("Error: {:?}", e);
+                    if let Some(client) = handler.lsp_client.as_ref() {
+                        let mut lsp = client.lock().await;
+                        let _ = lsp.shutdown().await;
+                    }
                     std::process::exit(1);
                 }
+            }
+            if let Some(client) = handler.lsp_client.as_ref() {
+                let mut lsp = client.lock().await;
+                let _ = lsp.shutdown().await;
             }
             return Ok(());
         }
@@ -1399,6 +1404,10 @@ async fn main() -> Result<()> {
             } else {
                 eprintln!("Usage: <tool_name> <json_arguments>");
             }
+        }
+        if let Some(client) = handler.lsp_client.as_ref() {
+            let mut lsp = client.lock().await;
+            let _ = lsp.shutdown().await;
         }
         return Ok(());
     }
