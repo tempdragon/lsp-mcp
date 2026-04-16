@@ -120,6 +120,7 @@ struct MyHandler {
     root_uri: Option<lsp_types::Uri>,
     lsp_command: String,
     subscribed_to_diagnostics: Arc<AtomicBool>,
+    workspace_diagnostics: Arc<dashmap::DashMap<String, Vec<serde_json::Value>>>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -137,6 +138,7 @@ impl MyHandler {
             root_uri,
             lsp_command,
             subscribed_to_diagnostics: Arc::new(AtomicBool::new(false)),
+            workspace_diagnostics: Arc::new(dashmap::DashMap::new()),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         }
@@ -886,6 +888,9 @@ impl MyHandler {
                     let all_files = Self::find_files(&root_dir, ".rs");
 
                     for abs_path in all_files {
+                        // CRITICAL: We must ensure the file is open before making a DocumentSymbolRequest.
+                        // If the file is not open, the LSP server (like rust-analyzer) may not have indexed it
+                        // yet or might refuse to return symbols for an unknown file, causing the fallback to fail silently.
                         let _ = lsp.ensure_file_open(&abs_path).await;
                         let uri = Url::from_file_path(&abs_path).unwrap();
                         let doc_params = lsp_types::DocumentSymbolParams {
@@ -970,6 +975,9 @@ impl MyHandler {
                     let mut hover_info = None;
                     if args.hover_detail != "none" {
                         if let Ok(abs_path) = url.to_file_path() {
+                            // CRITICAL: We must ensure the file is open.
+                            // Although we received the URI from a WorkspaceSymbolResponse, the file might not be
+                            // open/parsed by the LSP server yet, meaning hover info might be empty or missing.
                             let _ = lsp.ensure_file_open(&abs_path).await;
                         }
                         let hover_params = lsp_types::HoverParams {
@@ -1207,7 +1215,38 @@ impl MyHandler {
         &self,
         _context: RequestContext<RoleServer>,
     ) -> Result<String, ErrorData> {
-        Ok("Workspace diagnostics UI opened".to_string())
+        let mut all_diags = Vec::new();
+        for entry in self.workspace_diagnostics.iter() {
+            let path = entry.key();
+            let diags = entry.value();
+            if !diags.is_empty() {
+                all_diags.push(format!("File: {}", path));
+                for diag in diags {
+                    let severity = match diag.get("severity").and_then(|s| s.as_i64()) {
+                        Some(1) => "Error",
+                        Some(2) => "Warning",
+                        Some(3) => "Info",
+                        Some(4) => "Hint",
+                        _ => "Diagnostic",
+                    };
+                    let source = diag.get("source").and_then(|s| s.as_str()).unwrap_or("unknown");
+                    let message = diag.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                    let line = diag.get("range").and_then(|r| r.get("start")).and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0);
+                    let character = diag.get("range").and_then(|r| r.get("start")).and_then(|s| s.get("character")).and_then(|c| c.as_u64()).unwrap_or(0);
+                    
+                    let symbol = diag.get("symbolName").and_then(|s| s.as_str()).unwrap_or_default();
+                    let symbol_str = if symbol.is_empty() { String::new() } else { format!(" [{}]", symbol) };
+
+                    all_diags.push(format!("  [{}] {}{}: {} ({}:{})", source, severity, symbol_str, message, line, character));
+                }
+            }
+        }
+        
+        if all_diags.is_empty() {
+            Ok("No workspace diagnostics found.".to_string())
+        } else {
+            Ok(all_diags.join("\n"))
+        }
     }
 }
 
@@ -1389,6 +1428,9 @@ async fn main() -> Result<()> {
                         handler_for_notif.lsp_client.lock().await.as_ref().cloned();
                     if let Some(lsp_client) = active_lsp_client {
                         let mut lsp = lsp_client.lock().await;
+                        // CRITICAL: We must ensure the file is open before making a DocumentSymbolRequest
+                        // for enrichment. Otherwise, the LSP server might not have the document parsed
+                        // or will refuse the request entirely.
                         let _ = lsp.ensure_file_open(&path).await;
                         let lsp_uri: lsp_types::Uri = uri_str.parse().unwrap();
                         let symbol_params = lsp_types::DocumentSymbolParams {
@@ -1427,6 +1469,13 @@ async fn main() -> Result<()> {
                         }
                     }
                     MyHandler::enrich_diagnostics(diagnostics, &lines, &doc_symbols, &path);
+                    
+                    let path_str = path.to_string_lossy().to_string();
+                    if diagnostics.is_empty() {
+                        handler_for_notif.workspace_diagnostics.remove(&path_str);
+                    } else {
+                        handler_for_notif.workspace_diagnostics.insert(path_str, diagnostics.clone().into_iter().collect());
+                    }
                 }
 
                 if handler_for_notif
