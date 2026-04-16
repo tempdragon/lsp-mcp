@@ -795,7 +795,12 @@ impl MyHandler {
                 lsp_types::SymbolKind,
                 lsp_types::OneOf<lsp_types::Location, lsp_types::Uri>,
             )> = Vec::new();
-            if let Some(uri) = search_file_uri {
+            if let Some(uri) = &search_file_uri {
+                let abs_path = Url::parse(&uri.to_string())
+                    .unwrap()
+                    .to_file_path()
+                    .unwrap();
+                let _ = lsp.ensure_file_open(&abs_path).await;
                 let doc_params = lsp_types::DocumentSymbolParams {
                     text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
                     work_done_progress_params: Default::default(),
@@ -826,18 +831,6 @@ impl MyHandler {
                             )
                         }
                     }
-                }
-                if let Some(hint) = args.location_hint {
-                    lsp_results.sort_by_key(|(_, _, loc)| {
-                        if let lsp_types::OneOf::Left(l) = loc {
-                            let d_line = (l.range.start.line as i32 - hint.line as i32).abs();
-                            let d_char =
-                                (l.range.start.character as i32 - hint.character as i32).abs();
-                            d_line * 1000 + d_char
-                        } else {
-                            i32::MAX
-                        }
-                    });
                 }
             } else {
                 let query = if let Some(context) = &args.context_hint {
@@ -880,7 +873,93 @@ impl MyHandler {
                         }
                     }
                 }
+
+                // Aggressive fallback if no results found globally
+                if lsp_results.is_empty() {
+                    let root_dir = self
+                        .root_uri
+                        .as_ref()
+                        .and_then(|u| Url::parse(&u.to_string()).ok()?.to_file_path().ok())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+                    // Find ALL .rs files in the workspace
+                    let all_files = Self::find_files(&root_dir, ".rs");
+
+                    for abs_path in all_files {
+                        let _ = lsp.ensure_file_open(&abs_path).await;
+                        let uri = Url::from_file_path(&abs_path).unwrap();
+                        let doc_params = lsp_types::DocumentSymbolParams {
+                            text_document: lsp_types::TextDocumentIdentifier {
+                                uri: uri.clone().to_string().parse().unwrap(),
+                            },
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        };
+                        if let Ok(Some(response)) = lsp
+                            .send_request::<lsp_types::request::DocumentSymbolRequest>(doc_params)
+                            .await
+                        {
+                            match response {
+                                lsp_types::DocumentSymbolResponse::Flat(symbols) => {
+                                    for s in symbols {
+                                        if s.name.contains(&args.symbol_name) {
+                                            lsp_results.push((
+                                                s.name,
+                                                s.kind,
+                                                lsp_types::OneOf::Left(s.location),
+                                            ));
+                                        }
+                                    }
+                                }
+                                lsp_types::DocumentSymbolResponse::Nested(symbols) => {
+                                    MyHandler::collect_nested_matching_symbols(
+                                        &symbols,
+                                        &args.symbol_name,
+                                        &uri.to_string().parse().unwrap(),
+                                        &mut lsp_results,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             }
+
+            // Improve ranking: Exact match > Starts with > Contains
+            lsp_results.sort_by(|(name_a, _, _), (name_b, _, _)| {
+                let score = |name: &str| {
+                    if name == args.symbol_name {
+                        0 // Exact match (best)
+                    } else if name.starts_with(&args.symbol_name) {
+                        1 // Starts with
+                    } else if name.contains(&args.symbol_name) {
+                        2 // Contains
+                    } else {
+                        3 // Fuzzy/Other
+                    }
+                };
+
+                let score_a = score(name_a);
+                let score_b = score(name_b);
+
+                score_a
+                    .cmp(&score_b)
+                    .then_with(|| name_a.len().cmp(&name_b.len()))
+            });
+
+            // Apply location hint if provided (highest priority if it exists)
+            if let Some(hint) = args.location_hint {
+                lsp_results.sort_by_key(|(_, _, loc)| {
+                    if let lsp_types::OneOf::Left(l) = loc {
+                        let d_line = (l.range.start.line as i32 - hint.line as i32).abs();
+                        let d_char = (l.range.start.character as i32 - hint.character as i32).abs();
+                        d_line * 1000 + d_char
+                    } else {
+                        i32::MAX
+                    }
+                });
+            }
+
             if args.feeling_lucky && !lsp_results.is_empty() {
                 lsp_results = vec![lsp_results.remove(0)];
             }
@@ -890,6 +969,9 @@ impl MyHandler {
                     let url = Url::parse(&location.uri.to_string()).unwrap();
                     let mut hover_info = None;
                     if args.hover_detail != "none" {
+                        if let Ok(abs_path) = url.to_file_path() {
+                            let _ = lsp.ensure_file_open(&abs_path).await;
+                        }
                         let hover_params = lsp_types::HoverParams {
                             text_document_position_params: lsp_types::TextDocumentPositionParams {
                                 text_document: lsp_types::TextDocumentIdentifier {
@@ -1307,6 +1389,7 @@ async fn main() -> Result<()> {
                         handler_for_notif.lsp_client.lock().await.as_ref().cloned();
                     if let Some(lsp_client) = active_lsp_client {
                         let mut lsp = lsp_client.lock().await;
+                        let _ = lsp.ensure_file_open(&path).await;
                         let lsp_uri: lsp_types::Uri = uri_str.parse().unwrap();
                         let symbol_params = lsp_types::DocumentSymbolParams {
                             text_document: lsp_types::TextDocumentIdentifier { uri: lsp_uri },
