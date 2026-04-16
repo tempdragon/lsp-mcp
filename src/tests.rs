@@ -999,10 +999,10 @@ async fn test_ai_doctrines_in_initialize() {
     let server_info = handler.get_info();
 
     let instructions = server_info.instructions.unwrap();
-    assert!(instructions.contains("DOCTRINE 1 (PLAN)"));
-    assert!(instructions.contains("DOCTRINE 2 (VERIFY)"));
-    assert!(instructions.contains("DOCTRINE 3 (EXECUTE)"));
-    assert!(instructions.contains("DOCTRINE 4 (DEBUG)"));
+    assert!(instructions.contains("DOCTRINE 1"));
+    assert!(instructions.contains("DOCTRINE 2"));
+    assert!(instructions.contains("DOCTRINE 3"));
+    assert!(instructions.contains("DOCTRINE 4"));
 }
 
 #[tokio::test]

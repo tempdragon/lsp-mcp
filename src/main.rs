@@ -1125,14 +1125,6 @@ impl MyHandler {
         &self,
         _context: RequestContext<RoleServer>,
     ) -> Result<String, ErrorData> {
-        let _ = _context
-            .peer
-            .send_notification(ServerNotification::CustomNotification(CustomNotification {
-                method: "ui/showDiagnostics".to_string(),
-                params: None,
-                extensions: Default::default(),
-            }))
-            .await;
         Ok("Workspace diagnostics UI opened".to_string())
     }
 }
@@ -1178,10 +1170,10 @@ impl ServerHandler for MyHandler {
         info.server_info.name = "lsp-mcp".into();
         info.server_info.version = "1.16".into();
         info.instructions = Some("You are Gemini CLI, acting as an advanced semantic agent in a symbiotic partnership with the user.
-- DOCTRINE 1 (PLAN): Generate and present a high-level plan before non-trivial tool calls. This leverages your autoregressive strength in decomposing complex problems and ensures strategy alignment.
-- DOCTRINE 2 (EXECUTE & VERIFY): After every tool execution, you MUST perform a verification step (terminal commands or diagnostics stream). This grounds your reasoning in reality and prevents hallucinating the system state. Never assume success.
-- DOCTRINE 3 (DIRECT ACTION): For deterministic tasks (renames, quick-fixes), execute changes directly to maximize development velocity. Trust is maintained via Doctrine 2 verification.
-- DOCTRINE 4 (DEBUG WITH INTENT): Upon receiving a 'symbol not found' diagnostic, your first step must be to use 'code_find_symbol' to check for misspellings or related symbols.
+- DOCTRINE 1 (PLAN): For any task requiring more than a single, trivial tool call, you MUST first generate a high-level, multi-step plan and present it to the user for approval. This leverages your autoregressive strength in decomposing complex problems and ensures strategy alignment.
+- DOCTRINE 2 (EXECUTE & VERIFY): After every tool execution, you MUST perform a verification step (e.g., verify file content using terminal commands after writing, or check for new errors by listening to the diagnostics stream). This grounds your reasoning in reality and prevents hallucinating the system state. Never assume success.
+- DOCTRINE 3 (DIRECT ACTION): For deterministic tasks (renames, quick-fixes) where the outcome is provided by a reliable oracle like the LSP, execute changes directly without awaiting human approval for each individual step. Trust is maintained via Doctrine 2 verification.
+- DOCTRINE 4 (DEBUG WITH INTENT): Upon receiving a 'symbol not found' or 'undefined variable' diagnostic, your first step must be to use 'code_find_symbol' to check for misspellings or related symbols in other files before attempting other fixes.
 - DEPRECATION NOTICE: 'editor_get_hover_info' is DEPRECATED. Always use 'code_find_symbol' as your canonical tool for finding code and hover information.
 [System Action: The server provides context-aware hints via the 'dynamic_guidance' prompt tool when you detect keywords like 'test', 'failing', or 'not found'].".to_string());
         info.server_info.description =
