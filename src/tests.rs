@@ -914,40 +914,6 @@ async fn test_negative_rename_non_existent() {
 }
 
 #[tokio::test]
-async fn test_filesystem_read_file() {
-    run_lsp_test(|ctx| async move {
-        let temp_file = ctx.project_path.join("read_test.txt");
-        tokio::fs::write(&temp_file, "mcp test content")
-            .await
-            .unwrap();
-
-        let mut args = serde_json::Map::new();
-        args.insert(
-            "path".to_string(),
-            serde_json::json!(temp_file.to_string_lossy()),
-        );
-
-        let mut params = CallToolRequestParams::new("filesystem_read_file".to_string());
-        params.arguments = Some(args.into_iter().collect());
-
-        let result = ctx
-            .handler
-            .call_tool(
-                params,
-                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
-            )
-            .await
-            .unwrap();
-
-        if let RawContent::Text(text) = &*result.content[0] {
-            assert_eq!(text.text, "mcp test content");
-        }
-        ctx.teardown().await;
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn test_mcp_prompts_dynamic_guidance() {
     run_lsp_test(|ctx| async move {
         // 1. Test List Prompts

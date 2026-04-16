@@ -94,13 +94,6 @@ struct InteractiveRenameArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct ReadFileArgs {
-    /// The absolute path to the file to read.
-    path: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 struct GetCompletionsArgs {
     /// The absolute or relative path to the file.
     path: String,
@@ -1059,19 +1052,6 @@ impl MyHandler {
             .await;
         Ok("Workspace diagnostics UI opened".to_string())
     }
-
-    #[tool(
-        description = "Reads the content of a file from the filesystem. Use this to verify the outcome of a file-writing operation (Doctrine 2)."
-    )]
-    async fn filesystem_read_file(
-        &self,
-        Parameters(args): Parameters<ReadFileArgs>,
-    ) -> Result<String, ErrorData> {
-        let content = tokio::fs::read_to_string(&args.path)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(content)
-    }
 }
 
 #[prompt_router]
@@ -1116,7 +1096,7 @@ impl ServerHandler for MyHandler {
         info.server_info.version = "1.16".into();
         info.instructions = Some("You are Gemini CLI, acting as an advanced semantic agent.
 - DOCTRINE 1 (PLAN): Generate and present a multi-step plan before non-trivial tool calls.
-- DOCTRINE 2 (VERIFY): After writing files, verify using 'filesystem_read_file' or terminal commands.
+- DOCTRINE 2 (VERIFY): After writing files, verify using terminal commands.
 - DOCTRINE 3 (EXECUTE): Execute deterministic tasks (e.g., LSP-based refactorings or fixes) directly without awaiting human approval for each step.
 - DOCTRINE 4 (DEBUG): Use 'code_find_symbol' as the first step for 'undefined' or 'not found' errors.
 [System Action: The server provides context-aware hints via the 'dynamic_guidance' prompt tool when you detect keywords like 'test', 'failing', or 'not found'].".to_string());
