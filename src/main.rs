@@ -746,7 +746,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "A powerful, unified tool for locating symbols and retrieving their information. It intelligently switches its search strategy: if 'file' is provided, it performs a fuzzy search to find a unique file; if omitted, it searches the entire workspace. Use this to resolve 'fuzzy' intent from multiple input types (hints, context) to a precise location. Arguments: 'symbolName' (required); 'file' (optional, full or partial path for fuzzy search); 'locationHint' (optional {line, character}); 'contextHint' (optional natural language description); 'hoverDetail' (optional 'none', 'signature', or 'full'); 'feelingLucky' (optional, default True, returns best match). Note: All position values are 0-based. Throws an error if a provided 'file' name is ambiguous."
+        description = "A powerful, unified tool for locating symbols and retrieving their information. It is your canonical tool for finding code and the standard way to retrieve hover information. It intelligently switches its search strategy: if 'file' is provided, it performs a fuzzy search to find a unique file; if omitted, it searches the entire workspace. Use this to resolve 'fuzzy' intent from multiple input types (hints, context) to a precise location. Arguments: 'symbolName' (required); 'file' (optional, full or partial path for fuzzy search); 'locationHint' (optional {line, character}); 'contextHint' (optional natural language description); 'hoverDetail' (optional 'none', 'signature', or 'full'); 'feelingLucky' (optional, default True, returns best match). Note: All position values are 0-based. Throws an error if a provided 'file' name is ambiguous."
     )]
     async fn code_find_symbol(
         &self,
