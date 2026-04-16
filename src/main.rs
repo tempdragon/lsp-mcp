@@ -1439,7 +1439,10 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         while let Some(mut notif) = notification_rx.recv().await {
             if let Some(method) = notif.get("method").and_then(|m| m.as_str()) {
-                eprintln!("Received LSP notification: {}", method);
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/lsp_methods.log").unwrap();
+                writeln!(file, "Received LSP notification: {}", method).unwrap();
+
                 if method == "textDocument/publishDiagnostics" && let Some(params) = notif.get_mut("params") {
                 let uri_str = params
                     .get("uri")
@@ -1447,102 +1450,106 @@ async fn main() -> Result<()> {
                     .map(|s| s.to_string());
                 eprintln!("Received publishDiagnostics for {:?}", uri_str);
 
-                if let (Some(uri_str_inner), Some(diagnostics)) = (
+                if let (Some(uri_str_inner), Some(diagnostics_val)) = (
                     uri_str.clone(),
                     params.get_mut("diagnostics").and_then(|d| d.as_array_mut()),
-                ) && let Ok(url) = Url::parse(&uri_str_inner)
-                    && let Ok(path) = url.to_file_path()
-                    && let Ok(content) = tokio::fs::read_to_string(&path).await
-                {
-                    let lines: Vec<&str> = content.lines().collect();
-                    let mut doc_symbols = Vec::new();
-                    let active_lsp_client =
-                        handler_for_notif.lsp_client.lock().await.as_ref().cloned();
-                    if let Some(lsp_client) = active_lsp_client {
-                        let mut lsp = lsp_client.lock().await;
-                        // CRITICAL: We must ensure the file is open before making a DocumentSymbolRequest
-                        // for enrichment. Otherwise, the LSP server might not have the document parsed
-                        // or will refuse the request entirely.
-                        let _ = lsp.ensure_file_open(&path).await;
-                        let lsp_uri: lsp_types::Uri = uri_str_inner.parse().unwrap();
-                        let symbol_params = lsp_types::DocumentSymbolParams {
-                            text_document: lsp_types::TextDocumentIdentifier { uri: lsp_uri },
-                            work_done_progress_params: Default::default(),
-                            partial_result_params: Default::default(),
-                        };
-                        if let Ok(Some(response)) = lsp
-                            .send_request::<lsp_types::request::DocumentSymbolRequest>(
-                                symbol_params,
-                            )
-                            .await
-                        {
-                            match response {
-                                lsp_types::DocumentSymbolResponse::Flat(s) => {
-                                    doc_symbols = s
-                                        .into_iter()
-                                        .map(|si| (si.name, si.location.range))
-                                        .collect()
-                                }
-                                lsp_types::DocumentSymbolResponse::Nested(s) => {
-                                    fn flatten(
-                                        symbols: Vec<lsp_types::DocumentSymbol>,
-                                        target: &mut Vec<(String, lsp_types::Range)>,
-                                    ) {
-                                        for s in symbols {
-                                            target.push((s.name, s.range));
-                                            if let Some(children) = s.children {
-                                                flatten(children, target);
+                ) {
+                    let mut diagnostics = diagnostics_val.clone(); // Clone for the spawned task
+                    let handler_for_notif_clone = handler_for_notif.clone();
+                    let peer_clone = peer.clone();
+                    let notif_params = notif["params"].as_object().cloned().unwrap_or_default();
+
+                    tokio::spawn(async move {
+                        if let Ok(url) = Url::parse(&uri_str_inner) {
+                            if let Ok(path) = url.to_file_path() {
+                                if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                                    let lines: Vec<&str> = content.lines().collect();
+                                    let mut doc_symbols = Vec::new();
+                                    let active_lsp_client =
+                                        handler_for_notif_clone.lsp_client.lock().await.as_ref().cloned();
+                                    if let Some(lsp_client) = active_lsp_client {
+                                        let mut lsp = lsp_client.lock().await;
+                                        // CRITICAL: We must ensure the file is open before making a DocumentSymbolRequest
+                                        let _ = lsp.ensure_file_open(&path).await;
+                                        let lsp_uri: lsp_types::Uri = uri_str_inner.parse().unwrap();
+                                        let symbol_params = lsp_types::DocumentSymbolParams {
+                                            text_document: lsp_types::TextDocumentIdentifier { uri: lsp_uri },
+                                            work_done_progress_params: Default::default(),
+                                            partial_result_params: Default::default(),
+                                        };
+                                        if let Ok(Some(response)) = lsp
+                                            .send_request::<lsp_types::request::DocumentSymbolRequest>(
+                                                symbol_params,
+                                            )
+                                            .await
+                                        {
+                                            match response {
+                                                lsp_types::DocumentSymbolResponse::Flat(s) => {
+                                                    doc_symbols = s
+                                                        .into_iter()
+                                                        .map(|si| (si.name, si.location.range))
+                                                        .collect()
+                                                }
+                                                lsp_types::DocumentSymbolResponse::Nested(s) => {
+                                                    fn flatten(
+                                                        symbols: Vec<lsp_types::DocumentSymbol>,
+                                                        target: &mut Vec<(String, lsp_types::Range)>,
+                                                    ) {
+                                                        for s in symbols {
+                                                            target.push((s.name, s.range));
+                                                            if let Some(children) = s.children {
+                                                                flatten(children, target);
+                                                            }
+                                                        }
+                                                    }
+                                                    flatten(s, &mut doc_symbols);
+                                                }
                                             }
                                         }
                                     }
-                                    flatten(s, &mut doc_symbols);
+                                    MyHandler::enrich_diagnostics(&mut diagnostics, &lines, &doc_symbols, &path);
+
+                                    let path_str = path.to_string_lossy().to_string();
+                                    let _ = tokio::fs::write("/tmp/diags.log", format!("Got diags for {}\n", path_str)).await;
+                                    if diagnostics.is_empty() {
+                                        handler_for_notif_clone.workspace_diagnostics.remove(&path_str);
+                                    } else {
+                                        handler_for_notif_clone
+                                            .workspace_diagnostics
+                                            .insert(path_str, diagnostics.clone().into_iter().collect());
+                                    }
+                                } else {
+                                    let path_str = path.to_string_lossy().to_string();
+                                    let _ = tokio::fs::write("/tmp/diags.log", format!("Got empty/failed diags for {}\n", path_str)).await;
+                                    if diagnostics.is_empty() {
+                                        handler_for_notif_clone.workspace_diagnostics.remove(&path_str);
+                                    } else {
+                                        handler_for_notif_clone
+                                            .workspace_diagnostics
+                                            .insert(path_str, diagnostics.clone().into_iter().collect());
+                                    }
                                 }
                             }
                         }
-                    }
-                    MyHandler::enrich_diagnostics(diagnostics, &lines, &doc_symbols, &path);
 
-                    let path_str = path.to_string_lossy().to_string();
-                    if diagnostics.is_empty() {
-                        handler_for_notif.workspace_diagnostics.remove(&path_str);
-                    } else {
-                        handler_for_notif
-                            .workspace_diagnostics
-                            .insert(path_str, diagnostics.clone().into_iter().collect());
-                    }
-                } else if let (Some(uri_str), Some(diagnostics)) = (
-                    uri_str,
-                    params.get_mut("diagnostics").and_then(|d| d.as_array_mut()),
-                ) {
-                    if let Ok(url) = Url::parse(&uri_str) {
-                        if let Ok(path) = url.to_file_path() {
-                            let path_str = path.to_string_lossy().to_string();
-                            if diagnostics.is_empty() {
-                                handler_for_notif.workspace_diagnostics.remove(&path_str);
-                            } else {
-                                handler_for_notif
-                                    .workspace_diagnostics
-                                    .insert(path_str, diagnostics.clone().into_iter().collect());
-                            }
+                        if handler_for_notif_clone
+                            .subscribed_to_diagnostics
+                            .load(Ordering::SeqCst)
+                        {
+                            let mut enriched_params = notif_params;
+                            enriched_params.insert("diagnostics".to_string(), serde_json::Value::Array(diagnostics));
+                            
+                            let _ = peer_clone
+                                .send_notification(ServerNotification::CustomNotification(
+                                    CustomNotification {
+                                        method: "notifications/diagnostics".to_string(),
+                                        params: Some(serde_json::Value::Object(enriched_params)),
+                                        extensions: Default::default(),
+                                    },
+                                ))
+                                .await;
                         }
-                    }
-                }
-
-                if handler_for_notif
-                    .subscribed_to_diagnostics
-                    .load(Ordering::SeqCst)
-                {
-                    let _ = peer
-                        .send_notification(ServerNotification::CustomNotification(
-                            CustomNotification {
-                                method: "notifications/diagnostics".to_string(),
-                                params: Some(serde_json::Value::Object(
-                                    notif["params"].as_object().cloned().unwrap_or_default(),
-                                )),
-                                extensions: Default::default(),
-                            },
-                        ))
-                        .await;
+                    });
                 }
                 } // End of if method == "textDocument/publishDiagnostics"
             } // End of if let Some(method)
