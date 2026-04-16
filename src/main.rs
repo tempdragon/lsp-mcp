@@ -1063,7 +1063,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "Initiates a safe, workspace-wide rename of a symbol. This handles finding the symbol, getting all references, and applying changes autonomously. When I identify a symbol with a poor name, I will call this tool. Arguments: 'path' (required); 'symbolToFind' (required, object with 'symbolName' and optional 'locationHint'/'contextHint'); 'newName' (required). Note: All position values used for finding the symbol must be 0-based."
+        description = "Initiates a safe, workspace-wide rename of a symbol. This handles finding the symbol, getting all references, and applying changes autonomously. When I identify a symbol with a poor name, I will call this tool. Arguments: 'path' (required); 'symbolToFind' (required, object with 'symbolName' and optional 'locationHint'/'contextHint'); 'newName' (required). Returns: A status object indicating success or failure of the rename operation. Note: All position values used for finding the symbol must be 0-based."
     )]
     async fn refactor_interactive_rename(
         &self,
@@ -1141,7 +1141,7 @@ impl MyHandler {
 impl MyHandler {
     #[prompt(
         name = "dynamic_guidance",
-        description = "Provides just-in-time guidance based on context."
+        description = "Provides just-in-time guidance based on context. It dynamically injects 'system notes' or 'hints' into the prompt based on your query to guide the AI towards the most effective and reliable workflow."
     )]
     async fn dynamic_guidance(
         &self,
