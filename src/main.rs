@@ -118,6 +118,7 @@ struct MyHandler {
     lsp_client: Arc<Mutex<Option<Arc<Mutex<lsp::LspClient>>>>>,
     notification_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
     root_uri: Option<lsp_types::Uri>,
+    lsp_command: String,
     subscribed_to_diagnostics: Arc<AtomicBool>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
@@ -127,12 +128,14 @@ impl MyHandler {
     fn new(
         notification_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
         root_uri: Option<lsp_types::Uri>,
+        lsp_command: String,
         pre_initialized: Option<Arc<Mutex<lsp::LspClient>>>,
     ) -> Self {
         Self {
             lsp_client: Arc::new(Mutex::new(pre_initialized)),
             notification_tx,
             root_uri,
+            lsp_command,
             subscribed_to_diagnostics: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
@@ -146,7 +149,7 @@ impl MyHandler {
         }
 
         match lsp::LspClient::start(
-            "rust-analyzer",
+            &self.lsp_command,
             &[],
             self.notification_tx.clone(),
             self.root_uri.clone(),
@@ -165,12 +168,17 @@ impl MyHandler {
         }
     }
 
-    fn to_absolute_path(path_str: &str) -> std::path::PathBuf {
+    fn to_absolute_path(&self, path_str: &str) -> std::path::PathBuf {
         let path = std::path::Path::new(path_str);
         if path.is_absolute() {
             path.to_path_buf()
         } else {
-            std::env::current_dir().unwrap_or_default().join(path)
+            let base_dir = self
+                .root_uri
+                .as_ref()
+                .and_then(|uri| Url::parse(&uri.to_string()).ok()?.to_file_path().ok())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            base_dir.join(path)
         }
     }
 
@@ -180,6 +188,29 @@ impl MyHandler {
             .trim_end_matches(';')
             .trim()
             .to_string()
+    }
+
+    fn find_files(dir: &std::path::Path, query: &str) -> Vec<std::path::PathBuf> {
+        let mut matches = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name == "target"
+                        || name == ".git"
+                        || name == "node_modules"
+                        || name.starts_with('.')
+                    {
+                        continue;
+                    }
+                    matches.extend(Self::find_files(&path, query));
+                } else if path.to_string_lossy().contains(query) {
+                    matches.push(path);
+                }
+            }
+        }
+        matches
     }
 
     fn collect_nested_matching_symbols(
@@ -211,6 +242,51 @@ impl MyHandler {
                 Self::collect_nested_matching_symbols(children, name_filter, uri, results);
             }
         }
+    }
+
+    fn find_symbol_in_hierarchy<'a>(
+        symbols: &'a [lsp_types::DocumentSymbol],
+        target_name: &str,
+    ) -> Option<&'a lsp_types::DocumentSymbol> {
+        let parts: Vec<&str> = target_name.split("::").collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut current_symbols = symbols;
+        let mut current_found = None;
+
+        for part in parts {
+            let mut found = None;
+            for s in current_symbols {
+                if s.name == part {
+                    found = Some(s);
+                    break;
+                }
+            }
+            if let Some(s) = found {
+                current_found = Some(s);
+                if let Some(children) = &s.children {
+                    current_symbols = children;
+                } else {
+                    current_symbols = &[];
+                }
+            } else {
+                // If we didn't find the exact part at this level, let's try searching recursively
+                // just in case it's nested without all parents specified.
+                for s in current_symbols {
+                    if let Some(children) = &s.children {
+                        if let Some(found_nested) =
+                            Self::find_symbol_in_hierarchy(children, target_name)
+                        {
+                            return Some(found_nested);
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+        current_found
     }
 
     fn collect_nested_symbol_members(
@@ -376,10 +452,11 @@ impl MyHandler {
     ) -> anyhow::Result<()> {
         let url = Url::parse(&uri.to_string())?;
         if let Ok(path) = url.to_file_path() {
-            let mut content = tokio::fs::read_to_string(&path).await?;
-            let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+            let content = tokio::fs::read_to_string(&path).await?;
+            let mut rope = ropey::Rope::from_str(&content);
 
             let mut sorted_edits = edits.to_vec();
+            // Sort in reverse order (bottom-up, right-to-left) to avoid invalidating offsets
             sorted_edits.sort_by(|a, b| {
                 b.range
                     .start
@@ -389,49 +466,38 @@ impl MyHandler {
             });
 
             for edit in sorted_edits {
-                self.apply_text_edit(&mut lines, &edit);
+                let start_line = edit.range.start.line as usize;
+                let start_cu = edit.range.start.character as usize;
+                let end_line = edit.range.end.line as usize;
+                let end_cu = edit.range.end.character as usize;
+
+                let start_char_idx = if start_line < rope.len_lines() {
+                    let line_start = rope.line_to_char(start_line);
+                    let line_slice = rope.line(start_line);
+                    let cu_offset = start_cu.min(line_slice.len_utf16_cu());
+                    line_start + line_slice.utf16_cu_to_char(cu_offset)
+                } else {
+                    rope.len_chars()
+                };
+
+                let end_char_idx = if end_line < rope.len_lines() {
+                    let line_start = rope.line_to_char(end_line);
+                    let line_slice = rope.line(end_line);
+                    let cu_offset = end_cu.min(line_slice.len_utf16_cu());
+                    line_start + line_slice.utf16_cu_to_char(cu_offset)
+                } else {
+                    rope.len_chars()
+                };
+
+                if start_char_idx <= end_char_idx {
+                    rope.remove(start_char_idx..end_char_idx);
+                    rope.insert(start_char_idx, &edit.new_text);
+                }
             }
 
-            content = lines.join("\n");
-            tokio::fs::write(&path, content).await?;
+            tokio::fs::write(&path, rope.to_string()).await?;
         }
         Ok(())
-    }
-
-    fn apply_text_edit(&self, lines: &mut Vec<String>, edit: &lsp_types::TextEdit) {
-        let start_line = edit.range.start.line as usize;
-        let start_char = edit.range.start.character as usize;
-        let end_line = edit.range.end.line as usize;
-        let end_char = edit.range.end.character as usize;
-
-        if start_line == end_line {
-            if let Some(line) = lines.get_mut(start_line) {
-                let mut new_line = String::new();
-                new_line.push_str(&line[..start_char]);
-                new_line.push_str(&edit.new_text);
-                new_line.push_str(&line[end_char..]);
-                *line = new_line;
-            }
-        } else {
-            if start_line >= lines.len() || end_line >= lines.len() {
-                return;
-            }
-            let first_part = lines[start_line][..start_char].to_string();
-            let last_part = lines[end_line][end_char..].to_string();
-            let mut new_text_lines: Vec<String> =
-                edit.new_text.lines().map(|s| s.to_string()).collect();
-            if edit.new_text.ends_with('\n') {
-                new_text_lines.push(String::new());
-            }
-            if new_text_lines.is_empty() {
-                new_text_lines.push(first_part + &last_part);
-            } else {
-                new_text_lines[0] = first_part + &new_text_lines[0];
-                let last_idx = new_text_lines.len() - 1;
-                new_text_lines[last_idx].push_str(&last_part);
-            }
-            lines.splice(start_line..=end_line, new_text_lines);
-        }
     }
 }
 
@@ -459,7 +525,7 @@ impl MyHandler {
     ) -> Result<String, ErrorData> {
         if let Some(lsp) = self.get_lsp_client().await {
             let mut lsp = lsp.lock().await;
-            let abs_path = Self::to_absolute_path(&args.diagnostic_object.path);
+            let abs_path = self.to_absolute_path(&args.diagnostic_object.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
             let lsp_params = lsp_types::CodeActionParams {
                 text_document: lsp_types::TextDocumentIdentifier {
@@ -545,7 +611,7 @@ impl MyHandler {
     ) -> Result<String, ErrorData> {
         if let Some(lsp) = self.get_lsp_client().await {
             let mut lsp = lsp.lock().await;
-            let abs_path = Self::to_absolute_path(&args.path);
+            let abs_path = self.to_absolute_path(&args.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
             let lsp_params = lsp_types::GotoDefinitionParams {
                 text_document_position_params: lsp_types::TextDocumentPositionParams {
@@ -631,7 +697,7 @@ impl MyHandler {
     ) -> Result<String, ErrorData> {
         if let Some(lsp) = self.get_lsp_client().await {
             let mut lsp = lsp.lock().await;
-            let abs_path = Self::to_absolute_path(&args.path);
+            let abs_path = self.to_absolute_path(&args.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
             let lsp_params = lsp_types::ReferenceParams {
                 text_document_position: lsp_types::TextDocumentPositionParams {
@@ -688,35 +754,41 @@ impl MyHandler {
     ) -> Result<String, ErrorData> {
         if let Some(lsp_client) = self.get_lsp_client().await {
             let mut lsp = lsp_client.lock().await;
-            let mut search_file_uri = None;
+            let mut search_file_uri: Option<lsp_types::Uri> = None;
             if let Some(file_hint) = &args.file {
-                let file_params = lsp_types::WorkspaceSymbolParams {
-                    query: file_hint.clone(),
-                    work_done_progress_params: Default::default(),
-                    partial_result_params: Default::default(),
+                let abs_path = self.to_absolute_path(file_hint);
+                let matches = if abs_path.exists() {
+                    vec![abs_path]
+                } else {
+                    let root_dir = self
+                        .root_uri
+                        .as_ref()
+                        .and_then(|u| Url::parse(&u.to_string()).ok()?.to_file_path().ok())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    Self::find_files(&root_dir, file_hint)
                 };
-                if let Ok(Some(lsp_types::WorkspaceSymbolResponse::Flat(symbols))) = lsp
-                    .send_request::<lsp_types::request::WorkspaceSymbolRequest>(file_params)
-                    .await
-                {
-                    let mut matches = Vec::new();
-                    for s in symbols {
-                        let uri = s.location.uri;
-                        if uri.to_string().contains(file_hint) && !matches.contains(&uri) {
-                            matches.push(uri);
-                        }
-                    }
-                    if matches.len() > 1 {
-                        return Err(ErrorData::internal_error(
-                            format!(
-                                "Ambiguous file name '{}'. Matches: {:?}",
-                                file_hint, matches
-                            ),
-                            None,
-                        ));
-                    }
-                    search_file_uri = matches.into_iter().next();
+
+                if matches.len() > 1 {
+                    return Err(ErrorData::internal_error(
+                        format!(
+                            "Ambiguous file name '{}'. Matches: {:?}",
+                            file_hint, matches
+                        ),
+                        None,
+                    ));
+                } else if matches.is_empty() {
+                    return Err(ErrorData::internal_error(
+                        format!("File '{}' not found", file_hint),
+                        None,
+                    ));
                 }
+                search_file_uri = Some(
+                    Url::from_file_path(&matches[0])
+                        .unwrap()
+                        .to_string()
+                        .parse()
+                        .unwrap(),
+                );
             }
             let mut lsp_results: Vec<(
                 String,
@@ -857,7 +929,7 @@ impl MyHandler {
     ) -> Result<String, ErrorData> {
         if let Some(lsp_client) = self.get_lsp_client().await {
             let mut lsp = lsp_client.lock().await;
-            let abs_path = Self::to_absolute_path(&args.symbol_path);
+            let abs_path = self.to_absolute_path(&args.symbol_path);
             let _ = lsp.ensure_file_open(&abs_path).await;
             let uri: lsp_types::Uri = Url::from_file_path(abs_path)
                 .unwrap()
@@ -899,15 +971,26 @@ impl MyHandler {
                         }
                     }
                     lsp_types::DocumentSymbolResponse::Nested(symbols) => {
-                        MyHandler::collect_nested_symbol_members(
-                            &symbols,
-                            0,
-                            args.level,
-                            &mut results,
-                            &lines,
-                        );
-                        for r in &mut results {
-                            r.name = format!("{}::{}", args.symbol, r.name);
+                        if let Some(target) =
+                            MyHandler::find_symbol_in_hierarchy(&symbols, &args.symbol)
+                        {
+                            if let Some(children) = &target.children {
+                                MyHandler::collect_nested_symbol_members(
+                                    children,
+                                    0,
+                                    args.level,
+                                    &mut results,
+                                    &lines,
+                                );
+                                for r in &mut results {
+                                    r.name = format!("{}::{}", args.symbol, r.name);
+                                }
+                            }
+                        } else {
+                            return Err(ErrorData::internal_error(
+                                format!("Symbol '{}' not found in file", args.symbol),
+                                None,
+                            ));
                         }
                     }
                 }
@@ -927,7 +1010,7 @@ impl MyHandler {
     ) -> Result<String, ErrorData> {
         if let Some(lsp_client) = self.get_lsp_client().await {
             let mut lsp = lsp_client.lock().await;
-            let abs_path = Self::to_absolute_path(&args.path);
+            let abs_path = self.to_absolute_path(&args.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
             let lsp_params = lsp_types::CompletionParams {
                 text_document_position: lsp_types::TextDocumentPositionParams {
@@ -988,7 +1071,7 @@ impl MyHandler {
     ) -> Result<String, ErrorData> {
         if let Some(lsp_client) = self.get_lsp_client().await {
             let mut lsp = lsp_client.lock().await;
-            let abs_path = Self::to_absolute_path(&args.path);
+            let abs_path = self.to_absolute_path(&args.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
             let position = args
                 .symbol_to_find
@@ -1121,6 +1204,10 @@ struct Cli {
     /// JSON arguments for the tool call (manual mode only)
     #[arg(long)]
     args: Option<String>,
+
+    /// The command to run the LSP server
+    #[arg(long, default_value = "rust-analyzer")]
+    lsp_command: String,
 }
 
 #[tokio::main]
@@ -1134,7 +1221,7 @@ async fn main() -> Result<()> {
         .ok()
         .map(|u| u.to_string().parse().unwrap());
 
-    let handler = MyHandler::new(notification_tx, root_uri, None);
+    let handler = MyHandler::new(notification_tx, root_uri, cli.lsp_command.clone(), None);
 
     if cli.manual {
         let peer = mock_server::dummy_peer(handler.clone()).await;
@@ -1223,7 +1310,8 @@ async fn main() -> Result<()> {
                 {
                     let lines: Vec<&str> = content.lines().collect();
                     let mut doc_symbols = Vec::new();
-                    let active_lsp_client = handler_for_notif.lsp_client.lock().await.as_ref().cloned();
+                    let active_lsp_client =
+                        handler_for_notif.lsp_client.lock().await.as_ref().cloned();
                     if let Some(lsp_client) = active_lsp_client {
                         let mut lsp = lsp_client.lock().await;
                         let lsp_uri: lsp_types::Uri = uri_str.parse().unwrap();

@@ -67,7 +67,8 @@ fn main() {
             .parse()
             .unwrap();
 
-        let (notification_tx, mut notification_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(100);
+        let (notification_tx, mut notification_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(100);
 
         // Drain notifications to prevent blocking AND wait for diagnostics
         let (sync_tx, sync_rx) = tokio::sync::oneshot::channel();
@@ -102,7 +103,12 @@ fn main() {
         lsp_client.ensure_file_open(&main_rs_path).await.unwrap();
 
         let lsp_client = Arc::new(Mutex::new(lsp_client));
-        let handler = MyHandler::new(notification_tx.clone(), Some(root_uri.clone()), Some(lsp_client.clone()));
+        let handler = MyHandler::new(
+            notification_tx.clone(),
+            Some(root_uri.clone()),
+            "rust-analyzer".to_string(),
+            Some(lsp_client.clone()),
+        );
         let peer = mock_server::dummy_peer(handler.clone()).await;
 
         // Wait up to 30 seconds for rust-analyzer to finish indexing
@@ -163,7 +169,7 @@ async fn test_editor_get_definition() {
                     RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
                 )
                 .await;
-            
+
             if let Ok(res) = result {
                 if let RawContent::Text(text) = &*res.content[0] {
                     if let Ok(locs) = serde_json::from_str::<Vec<models::Location>>(&text.text) {
@@ -276,10 +282,12 @@ async fn test_code_get_completions() {
                     RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
                 )
                 .await;
-            
+
             if let Ok(res) = result {
                 if let RawContent::Text(text) = &*res.content[0] {
-                    if let Ok(comps) = serde_json::from_str::<Vec<models::CompletionItem>>(&text.text) {
+                    if let Ok(comps) =
+                        serde_json::from_str::<Vec<models::CompletionItem>>(&text.text)
+                    {
                         completions = comps;
                         if !completions.is_empty() {
                             break;
@@ -326,7 +334,7 @@ async fn test_editor_get_references() {
                     RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
                 )
                 .await;
-            
+
             if let Ok(res) = result {
                 if let RawContent::Text(text) = &*res.content[0] {
                     if let Ok(locs) = serde_json::from_str::<Vec<models::Location>>(&text.text) {
@@ -383,10 +391,13 @@ async fn test_refactor_interactive_rename() {
                     RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
                 )
                 .await;
-            
+
             if let Ok(res) = result {
                 if let RawContent::Text(text) = &*res.content[0] {
-                    if text.text.contains("Applied") || text.text.contains("failed") || text.text.contains("no edits") {
+                    if text.text.contains("Applied")
+                        || text.text.contains("failed")
+                        || text.text.contains("no edits")
+                    {
                         success = true;
                         break;
                     }
@@ -395,10 +406,7 @@ async fn test_refactor_interactive_rename() {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
 
-        assert!(
-            success,
-            "Rename failed to return a proper result in time"
-        );
+        assert!(success, "Rename failed to return a proper result in time");
 
         // Verify change on disk only if it was actually applied
         let new_content = tokio::fs::read_to_string(&ctx.main_rs_path).await.unwrap();
@@ -596,7 +604,7 @@ async fn test_multi_file_find_symbol() {
                     RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
                 )
                 .await;
-            
+
             if let Ok(res) = result {
                 if let RawContent::Text(text) = &*res.content[0] {
                     if let Ok(locs) = serde_json::from_str::<Vec<models::Location>>(&text.text) {
@@ -743,7 +751,7 @@ async fn test_negative_get_definition_whitespace() {
                     RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
                 )
                 .await;
-            
+
             if let Ok(res) = result {
                 if let RawContent::Text(text) = &*res.content[0] {
                     locs_str = text.text.clone();
@@ -985,8 +993,8 @@ async fn test_ai_doctrines_in_initialize() {
     // This test verifies the instructions field in the actual main() setup logic
     // Since main() is hard to test directly, we verify the string matches the spec.
 
-    let (tx, _) = tokio::sync::mpsc::channel(1);
-    let handler = crate::MyHandler::new(tx, None, None);
+    let tx = tokio::sync::mpsc::channel(1).0;
+    let handler = crate::MyHandler::new(tx, None, "rust-analyzer".to_string(), None);
 
     let server_info = handler.get_info();
 
