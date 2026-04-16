@@ -135,6 +135,8 @@ impl LspClient {
             work_done_progress_params: Default::default(),
         };
 
+        std::fs::write("/tmp/lsp_init.log", format!("{:#?}", params)).unwrap();
+
         client
             .send_request::<lsp_types::request::Initialize>(params)
             .await?;

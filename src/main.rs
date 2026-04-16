@@ -1215,6 +1215,14 @@ impl MyHandler {
         &self,
         _context: RequestContext<RoleServer>,
     ) -> Result<String, ErrorData> {
+        // Wait up to 10 seconds for diagnostics to populate if they are empty
+        // This is necessary because some LSP servers (like rust-analyzer) run checks asynchronously on startup.
+        let mut retries = 20;
+        while self.workspace_diagnostics.is_empty() && retries > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            retries -= 1;
+        }
+
         let mut all_diags = Vec::new();
         for entry in self.workspace_diagnostics.iter() {
             let path = entry.key();
@@ -1229,19 +1237,42 @@ impl MyHandler {
                         Some(4) => "Hint",
                         _ => "Diagnostic",
                     };
-                    let source = diag.get("source").and_then(|s| s.as_str()).unwrap_or("unknown");
+                    let source = diag
+                        .get("source")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
                     let message = diag.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                    let line = diag.get("range").and_then(|r| r.get("start")).and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0);
-                    let character = diag.get("range").and_then(|r| r.get("start")).and_then(|s| s.get("character")).and_then(|c| c.as_u64()).unwrap_or(0);
-                    
-                    let symbol = diag.get("symbolName").and_then(|s| s.as_str()).unwrap_or_default();
-                    let symbol_str = if symbol.is_empty() { String::new() } else { format!(" [{}]", symbol) };
+                    let line = diag
+                        .get("range")
+                        .and_then(|r| r.get("start"))
+                        .and_then(|s| s.get("line"))
+                        .and_then(|l| l.as_u64())
+                        .unwrap_or(0);
+                    let character = diag
+                        .get("range")
+                        .and_then(|r| r.get("start"))
+                        .and_then(|s| s.get("character"))
+                        .and_then(|c| c.as_u64())
+                        .unwrap_or(0);
 
-                    all_diags.push(format!("  [{}] {}{}: {} ({}:{})", source, severity, symbol_str, message, line, character));
+                    let symbol = diag
+                        .get("symbolName")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default();
+                    let symbol_str = if symbol.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", symbol)
+                    };
+
+                    all_diags.push(format!(
+                        "  [{}] {}{}: {} ({}:{})",
+                        source, severity, symbol_str, message, line, character
+                    ));
                 }
             }
         }
-        
+
         if all_diags.is_empty() {
             Ok("No workspace diagnostics found.".to_string())
         } else {
@@ -1407,18 +1438,19 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         while let Some(mut notif) = notification_rx.recv().await {
-            if let Some(method) = notif.get("method").and_then(|m| m.as_str())
-                && method == "textDocument/publishDiagnostics"
-                && let Some(params) = notif.get_mut("params")
-            {
+            if let Some(method) = notif.get("method").and_then(|m| m.as_str()) {
+                eprintln!("Received LSP notification: {}", method);
+                if method == "textDocument/publishDiagnostics" && let Some(params) = notif.get_mut("params") {
                 let uri_str = params
                     .get("uri")
                     .and_then(|u| u.as_str())
                     .map(|s| s.to_string());
-                if let (Some(uri_str), Some(diagnostics)) = (
-                    uri_str,
+                eprintln!("Received publishDiagnostics for {:?}", uri_str);
+
+                if let (Some(uri_str_inner), Some(diagnostics)) = (
+                    uri_str.clone(),
                     params.get_mut("diagnostics").and_then(|d| d.as_array_mut()),
-                ) && let Ok(url) = Url::parse(&uri_str)
+                ) && let Ok(url) = Url::parse(&uri_str_inner)
                     && let Ok(path) = url.to_file_path()
                     && let Ok(content) = tokio::fs::read_to_string(&path).await
                 {
@@ -1432,7 +1464,7 @@ async fn main() -> Result<()> {
                         // for enrichment. Otherwise, the LSP server might not have the document parsed
                         // or will refuse the request entirely.
                         let _ = lsp.ensure_file_open(&path).await;
-                        let lsp_uri: lsp_types::Uri = uri_str.parse().unwrap();
+                        let lsp_uri: lsp_types::Uri = uri_str_inner.parse().unwrap();
                         let symbol_params = lsp_types::DocumentSymbolParams {
                             text_document: lsp_types::TextDocumentIdentifier { uri: lsp_uri },
                             work_done_progress_params: Default::default(),
@@ -1469,12 +1501,30 @@ async fn main() -> Result<()> {
                         }
                     }
                     MyHandler::enrich_diagnostics(diagnostics, &lines, &doc_symbols, &path);
-                    
+
                     let path_str = path.to_string_lossy().to_string();
                     if diagnostics.is_empty() {
                         handler_for_notif.workspace_diagnostics.remove(&path_str);
                     } else {
-                        handler_for_notif.workspace_diagnostics.insert(path_str, diagnostics.clone().into_iter().collect());
+                        handler_for_notif
+                            .workspace_diagnostics
+                            .insert(path_str, diagnostics.clone().into_iter().collect());
+                    }
+                } else if let (Some(uri_str), Some(diagnostics)) = (
+                    uri_str,
+                    params.get_mut("diagnostics").and_then(|d| d.as_array_mut()),
+                ) {
+                    if let Ok(url) = Url::parse(&uri_str) {
+                        if let Ok(path) = url.to_file_path() {
+                            let path_str = path.to_string_lossy().to_string();
+                            if diagnostics.is_empty() {
+                                handler_for_notif.workspace_diagnostics.remove(&path_str);
+                            } else {
+                                handler_for_notif
+                                    .workspace_diagnostics
+                                    .insert(path_str, diagnostics.clone().into_iter().collect());
+                            }
+                        }
                     }
                 }
 
@@ -1494,7 +1544,8 @@ async fn main() -> Result<()> {
                         ))
                         .await;
                 }
-            }
+                } // End of if method == "textDocument/publishDiagnostics"
+            } // End of if let Some(method)
         }
     });
 
