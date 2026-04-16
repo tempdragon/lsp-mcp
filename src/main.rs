@@ -122,19 +122,53 @@ fn default_one() -> u32 {
 
 #[derive(Clone)]
 struct MyHandler {
-    lsp_client: Option<Arc<Mutex<lsp::LspClient>>>,
+    lsp_client: Arc<Mutex<Option<Arc<Mutex<lsp::LspClient>>>>>,
+    notification_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+    root_uri: Option<lsp_types::Uri>,
     subscribed_to_diagnostics: Arc<AtomicBool>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
 
 impl MyHandler {
-    fn new(lsp_client: Option<Arc<Mutex<lsp::LspClient>>>) -> Self {
+    fn new(
+        notification_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+        root_uri: Option<lsp_types::Uri>,
+        pre_initialized: Option<Arc<Mutex<lsp::LspClient>>>,
+    ) -> Self {
         Self {
-            lsp_client,
+            lsp_client: Arc::new(Mutex::new(pre_initialized)),
+            notification_tx,
+            root_uri,
             subscribed_to_diagnostics: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
+        }
+    }
+
+    async fn get_lsp_client(&self) -> Option<Arc<Mutex<lsp::LspClient>>> {
+        let mut client_lock = self.lsp_client.lock().await;
+        if let Some(client) = client_lock.as_ref() {
+            return Some(client.clone());
+        }
+
+        match lsp::LspClient::start(
+            "rust-analyzer",
+            &[],
+            self.notification_tx.clone(),
+            self.root_uri.clone(),
+        )
+        .await
+        {
+            Ok(client) => {
+                let arc_client = Arc::new(Mutex::new(client));
+                *client_lock = Some(arc_client.clone());
+                Some(arc_client)
+            }
+            Err(e) => {
+                eprintln!("Warning: Could not start rust-analyzer: {}", e);
+                None
+            }
         }
     }
 
@@ -430,7 +464,7 @@ impl MyHandler {
         &self,
         Parameters(args): Parameters<GetActionsArgs>,
     ) -> Result<String, ErrorData> {
-        if let Some(lsp) = &self.lsp_client {
+        if let Some(lsp) = self.get_lsp_client().await {
             let mut lsp = lsp.lock().await;
             let abs_path = Self::to_absolute_path(&args.diagnostic_object.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
@@ -471,7 +505,7 @@ impl MyHandler {
         &self,
         Parameters(args): Parameters<ApplyActionArgs>,
     ) -> Result<String, ErrorData> {
-        if let Some(lsp_client) = &self.lsp_client {
+        if let Some(lsp_client) = self.get_lsp_client().await {
             if let Some(edit) = args.action_object.edit {
                 let workspace_edit: lsp_types::WorkspaceEdit =
                     serde_json::from_value(edit).unwrap();
@@ -516,7 +550,7 @@ impl MyHandler {
         &self,
         Parameters(args): Parameters<PathLineCharArgs>,
     ) -> Result<String, ErrorData> {
-        if let Some(lsp) = &self.lsp_client {
+        if let Some(lsp) = self.get_lsp_client().await {
             let mut lsp = lsp.lock().await;
             let abs_path = Self::to_absolute_path(&args.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
@@ -602,7 +636,7 @@ impl MyHandler {
         &self,
         Parameters(args): Parameters<PathLineCharArgs>,
     ) -> Result<String, ErrorData> {
-        if let Some(lsp) = &self.lsp_client {
+        if let Some(lsp) = self.get_lsp_client().await {
             let mut lsp = lsp.lock().await;
             let abs_path = Self::to_absolute_path(&args.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
@@ -659,7 +693,7 @@ impl MyHandler {
         &self,
         Parameters(args): Parameters<FindSymbolArgs>,
     ) -> Result<String, ErrorData> {
-        if let Some(lsp_client) = &self.lsp_client {
+        if let Some(lsp_client) = self.get_lsp_client().await {
             let mut lsp = lsp_client.lock().await;
             let mut search_file_uri = None;
             if let Some(file_hint) = &args.file {
@@ -828,7 +862,7 @@ impl MyHandler {
         &self,
         Parameters(args): Parameters<ShowSubSymbolArgs>,
     ) -> Result<String, ErrorData> {
-        if let Some(lsp_client) = &self.lsp_client {
+        if let Some(lsp_client) = self.get_lsp_client().await {
             let mut lsp = lsp_client.lock().await;
             let abs_path = Self::to_absolute_path(&args.symbol_path);
             let _ = lsp.ensure_file_open(&abs_path).await;
@@ -898,7 +932,7 @@ impl MyHandler {
         &self,
         Parameters(args): Parameters<GetCompletionsArgs>,
     ) -> Result<String, ErrorData> {
-        if let Some(lsp_client) = &self.lsp_client {
+        if let Some(lsp_client) = self.get_lsp_client().await {
             let mut lsp = lsp_client.lock().await;
             let abs_path = Self::to_absolute_path(&args.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
@@ -959,7 +993,7 @@ impl MyHandler {
         &self,
         Parameters(args): Parameters<InteractiveRenameArgs>,
     ) -> Result<String, ErrorData> {
-        if let Some(lsp_client) = &self.lsp_client {
+        if let Some(lsp_client) = self.get_lsp_client().await {
             let mut lsp = lsp_client.lock().await;
             let abs_path = Self::to_absolute_path(&args.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
@@ -1119,16 +1153,8 @@ async fn main() -> Result<()> {
     let root_uri: Option<lsp_types::Uri> = Url::from_directory_path(&current_dir)
         .ok()
         .map(|u| u.to_string().parse().unwrap());
-    let lsp_client =
-        match lsp::LspClient::start("rust-analyzer", &[], notification_tx, root_uri).await {
-            Ok(client) => Some(Arc::new(Mutex::new(client))),
-            Err(e) => {
-                eprintln!("Warning: Could not start rust-analyzer: {}", e);
-                None
-            }
-        };
 
-    let handler = MyHandler::new(lsp_client.clone());
+    let handler = MyHandler::new(notification_tx, root_uri, None);
 
     if cli.manual {
         let peer = mock_server::dummy_peer(handler.clone()).await;
@@ -1142,14 +1168,14 @@ async fn main() -> Result<()> {
                 Ok(res) => println!("{}", serde_json::to_string_pretty(&res).unwrap()),
                 Err(e) => {
                     eprintln!("Error: {:?}", e);
-                    if let Some(client) = handler.lsp_client.as_ref() {
+                    if let Some(client) = handler.lsp_client.lock().await.as_ref() {
                         let mut lsp = client.lock().await;
                         let _ = lsp.shutdown().await;
                     }
                     std::process::exit(1);
                 }
             }
-            if let Some(client) = handler.lsp_client.as_ref() {
+            if let Some(client) = handler.lsp_client.lock().await.as_ref() {
                 let mut lsp = client.lock().await;
                 let _ = lsp.shutdown().await;
             }
@@ -1185,7 +1211,7 @@ async fn main() -> Result<()> {
                 eprintln!("Usage: <tool_name> <json_arguments>");
             }
         }
-        if let Some(client) = handler.lsp_client.as_ref() {
+        if let Some(client) = handler.lsp_client.lock().await.as_ref() {
             let mut lsp = client.lock().await;
             let _ = lsp.shutdown().await;
         }
@@ -1193,7 +1219,6 @@ async fn main() -> Result<()> {
     }
 
     let handler_for_notif = handler.clone();
-    let lsp_client_for_enrichment = lsp_client.clone();
 
     let transport = rmcp::transport::io::stdio();
     let server = handler.serve(transport).await?;
@@ -1218,7 +1243,8 @@ async fn main() -> Result<()> {
                 {
                     let lines: Vec<&str> = content.lines().collect();
                     let mut doc_symbols = Vec::new();
-                    if let Some(lsp_client) = &lsp_client_for_enrichment {
+                    let active_lsp_client = handler_for_notif.lsp_client.lock().await.as_ref().cloned();
+                    if let Some(lsp_client) = active_lsp_client {
                         let mut lsp = lsp_client.lock().await;
                         let lsp_uri: lsp_types::Uri = uri_str.parse().unwrap();
                         let symbol_params = lsp_types::DocumentSymbolParams {
