@@ -504,7 +504,7 @@ impl MyHandler {
 #[tool_router]
 impl MyHandler {
     #[tool(
-        description = "Subscribes the AI to receive proactive notifications of diagnostics. When a new error appears, the system will send an Enriched Diagnostic Object that can be used with other tools."
+        description = "Subscribes the AI to receive proactive notifications of diagnostics. When a new error appears, the system will send an Enriched Diagnostic Object that includes the error message, the range, the symbol name involved, the source of that name (semantic vs textual), and the full line content. I will call this at the beginning of a task. Returns: A confirmation of the subscription. Note: The returned range object contains 0-based line and character positions."
     )]
     async fn editor_subscribe_to_diagnostics(&self) -> String {
         self.subscribed_to_diagnostics.store(true, Ordering::SeqCst);
@@ -517,7 +517,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "For a given diagnostic object, this tool fetches a list of potential 'Code Actions' or 'Quick Fixes' that the Language Server recommends."
+        description = "For a given diagnostic object, this tool fetches a list of potential 'Code Actions' or 'Quick Fixes' that the Language Server recommends. When I receive a diagnostic, my first step will be to call this tool to ask the LSP for suggested fixes. Arguments: 'diagnosticObject' (object, required). Returns: A list of Code Action objects, each describing a potential fix. Note: The range within the diagnosticObject uses 0-based indexing."
     )]
     async fn code_get_actions_for_diagnostic(
         &self,
@@ -558,7 +558,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "Applies a specific Code Action chosen from the list provided by code_get_actions_for_diagnostic. This tool executes the change directly to the codebase."
+        description = "Applies a specific Code Action chosen from the list provided by code_get_actions_for_diagnostic. This tool executes the change directly to the codebase. Once a suitable fix is identified, I will use this tool to execute the change directly. Arguments: 'actionObject' (object, required). Returns: A confirmation of success or failure."
     )]
     async fn code_apply_action(
         &self,
@@ -603,7 +603,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "Finds the definition of the symbol at a specific cursor position. Use this to navigate directly to its source to understand what it does."
+        description = "Finds the definition of the symbol at a specific cursor position. The tool queries the LSP for a 'textDocument/definition' response. When I encounter a function or class I don't recognize, I will use this to navigate directly to its source to understand what it does. Arguments: 'path' (required); 'line' (required, 0-based); 'character' (required, 0-based). Note: All position values (input and output) are 0-based."
     )]
     async fn editor_get_definition(
         &self,
@@ -689,7 +689,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "Finds all references to the symbol at a specific cursor position throughout the workspace. Use this for critical impact analysis before proposing changes."
+        description = "Finds all references to the symbol at a specific cursor position throughout the workspace. The tool queries the LSP for a 'textDocument/references' response. This is my critical impact analysis tool. Before I propose any change to a function, I must use this tool to understand its side effects. Arguments: 'path' (required); 'line' (required, 0-based); 'character' (required, 0-based). Note: Each returned location uses 0-based line and character numbers."
     )]
     async fn editor_get_references(
         &self,
@@ -746,7 +746,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "A powerful, unified tool for locating symbols and retrieving their information. It can search within a specific file or across the entire workspace. Use this as your canonical tool for finding code."
+        description = "A powerful, unified tool for locating symbols and retrieving their information. It intelligently switches its search strategy: if 'file' is provided, it performs a fuzzy search to find a unique file; if omitted, it searches the entire workspace. Use this to resolve 'fuzzy' intent from multiple input types (hints, context) to a precise location. Arguments: 'symbolName' (required); 'file' (optional, full or partial path for fuzzy search); 'locationHint' (optional {line, character}); 'contextHint' (optional natural language description); 'hoverDetail' (optional 'none', 'signature', or 'full'); 'feelingLucky' (optional, default True, returns best match). Note: All position values are 0-based. Throws an error if a provided 'file' name is ambiguous."
     )]
     async fn code_find_symbol(
         &self,
@@ -921,7 +921,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "Shows the methods, attributes, or functions defined within a given module, class, or other symbol. Use this to understand the internal structure without reading the entire body."
+        description = "Shows the methods, attributes, or functions defined within a given module, class, or other symbol. When I need to understand the internal structure of a class or module without reading its entire body, I will use this tool to get a quick summary of its members. Arguments: 'symbol' (required, class/module name); 'symbolPath' (required); 'level' (optional, default 1, depth of hierarchy). Returns: A structured object representing the members of the symbol, including their names, signatures, and positions. Note: All signature-related position information is 0-based."
     )]
     async fn code_show_sub_symbol(
         &self,
@@ -1002,7 +1002,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "Retrieves a list of suggested code completions at a specific cursor position. Use this when completing partial names or exploring available members."
+        description = "Retrieves a list of suggested code completions at a specific cursor position. I will use this tool when I am completing a partial symbol name or exploring available members at a given position to see what the Language Server suggests. Arguments: 'path' (required); 'line' (required, 0-based); 'character' (required, 0-based). Returns: A list of completion items, where each item includes a label, kind, and detail information. Note: All input and output positions are 0-based."
     )]
     async fn code_get_completions(
         &self,
@@ -1063,7 +1063,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "Initiates a safe, workspace-wide rename of a symbol. This handles finding the symbol, getting all references, and applying changes autonomously."
+        description = "Initiates a safe, workspace-wide rename of a symbol. This handles finding the symbol, getting all references, and applying changes autonomously. When I identify a symbol with a poor name, I will call this tool. Arguments: 'path' (required); 'symbolToFind' (required, object with 'symbolName' and optional 'locationHint'/'contextHint'); 'newName' (required). Note: All position values used for finding the symbol must be 0-based."
     )]
     async fn refactor_interactive_rename(
         &self,
@@ -1119,7 +1119,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "Commands the LSP to display all diagnostics (errors and warnings) for the entire workspace to the AI."
+        description = "Commands the LSP to display all diagnostics (errors and warnings) for the entire workspace to the AI. When my actions result in a large number of diagnostics, I will call this tool to give the user a comprehensive, interactive overview of the project's state, rather than sending a long, non-interactive list in the chat. Returns: A confirmation that the command was sent to the editor."
     )]
     async fn ui_show_workspace_diagnostics(
         &self,
@@ -1177,14 +1177,15 @@ impl ServerHandler for MyHandler {
         );
         info.server_info.name = "lsp-mcp".into();
         info.server_info.version = "1.16".into();
-        info.instructions = Some("You are Gemini CLI, acting as an advanced semantic agent.
-- DOCTRINE 1 (PLAN): Generate and present a multi-step plan before non-trivial tool calls.
-- DOCTRINE 2 (VERIFY): After writing files, verify using terminal commands.
-- DOCTRINE 3 (EXECUTE): Execute deterministic tasks (e.g., LSP-based refactorings or fixes) directly without awaiting human approval for each step.
-- DOCTRINE 4 (DEBUG): Use 'code_find_symbol' as the first step for 'undefined' or 'not found' errors.
+        info.instructions = Some("You are Gemini CLI, acting as an advanced semantic agent in a symbiotic partnership with the user.
+- DOCTRINE 1 (PLAN): Generate and present a high-level plan before non-trivial tool calls. This leverages your autoregressive strength in decomposing complex problems and ensures strategy alignment.
+- DOCTRINE 2 (EXECUTE & VERIFY): After every tool execution, you MUST perform a verification step (terminal commands or diagnostics stream). This grounds your reasoning in reality and prevents hallucinating the system state. Never assume success.
+- DOCTRINE 3 (DIRECT ACTION): For deterministic tasks (renames, quick-fixes), execute changes directly to maximize development velocity. Trust is maintained via Doctrine 2 verification.
+- DOCTRINE 4 (DEBUG WITH INTENT): Upon receiving a 'symbol not found' diagnostic, your first step must be to use 'code_find_symbol' to check for misspellings or related symbols.
+- DEPRECATION NOTICE: 'editor_get_hover_info' is DEPRECATED. Always use 'code_find_symbol' as your canonical tool for finding code and hover information.
 [System Action: The server provides context-aware hints via the 'dynamic_guidance' prompt tool when you detect keywords like 'test', 'failing', or 'not found'].".to_string());
         info.server_info.description =
-            Some("LSP-MCP server implementing AI Development Specification 1.16".to_string());
+            Some("LSP-MCP server enabling a proactive, collaborative, and deeply context-aware workflow through a symbiotic partnership between human and AI.".to_string());
         info.server_info.title = Some("LSP MCP Server".to_string());
         info
     }
