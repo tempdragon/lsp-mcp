@@ -466,34 +466,6 @@ async fn test_code_get_actions_for_diagnostic() {
 }
 
 #[tokio::test]
-async fn test_editor_subscribe_to_diagnostics() {
-    run_lsp_test(|ctx| async move {
-        let mut params = CallToolRequestParams::new("editor_subscribe_to_diagnostics".to_string());
-        params.arguments = Some(serde_json::Map::new().into_iter().collect());
-
-        let result = ctx
-            .handler
-            .call_tool(
-                params,
-                RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
-            )
-            .await
-            .unwrap();
-
-        if let RawContent::Text(text) = &*result.content[0] {
-            assert!(text.text.contains("Subscribed"));
-        }
-        assert!(
-            ctx.handler
-                .subscribed_to_diagnostics
-                .load(std::sync::atomic::Ordering::SeqCst)
-        );
-        ctx.teardown().await;
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn test_ui_show_workspace_diagnostics() {
     run_lsp_test(|ctx| async move {
         let mut params = CallToolRequestParams::new("ui_show_workspace_diagnostics".to_string());

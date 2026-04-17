@@ -21,7 +21,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
 use url::Url;
 
@@ -119,7 +119,6 @@ struct MyHandler {
     notification_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
     root_uri: Option<lsp_types::Uri>,
     lsp_command: String,
-    subscribed_to_diagnostics: Arc<AtomicBool>,
     workspace_diagnostics: Arc<dashmap::DashMap<String, Vec<serde_json::Value>>>,
     diagnostics_update_seq: Arc<AtomicU64>,
     diagnostics_notify: Arc<Notify>,
@@ -141,7 +140,6 @@ impl MyHandler {
             notification_tx,
             root_uri,
             lsp_command,
-            subscribed_to_diagnostics: Arc::new(AtomicBool::new(false)),
             workspace_diagnostics: Arc::new(dashmap::DashMap::new()),
             diagnostics_update_seq: Arc::new(AtomicU64::new(0)),
             diagnostics_notify: Arc::new(Notify::new()),
@@ -616,19 +614,6 @@ impl MyHandler {
 
 #[tool_router]
 impl MyHandler {
-    #[tool(
-        description = "Subscribes the AI to receive proactive notifications of diagnostics. When a new error appears, the system will send an Enriched Diagnostic Object that includes the error message, the range, the symbol name involved, the source of that name (semantic vs textual), and the full line content. I will call this at the beginning of a task. Returns: A confirmation of the subscription. Note: The returned range object contains 0-based line and character positions."
-    )]
-    async fn editor_subscribe_to_diagnostics(&self) -> String {
-        self.subscribed_to_diagnostics.store(true, Ordering::SeqCst);
-        serde_json::to_string(&serde_json::json!({
-            "status": "Subscribed",
-            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": u32::MAX, "character": u32::MAX } },
-            "scope": "workspace"
-        }))
-        .unwrap()
-    }
-
     #[tool(
         description = "For a given diagnostic object, this tool fetches a list of potential 'Code Actions' or 'Quick Fixes' that the Language Server recommends. When I receive a diagnostic, my first step will be to call this tool to ask the LSP for suggested fixes. Arguments: 'diagnosticObject' (object, required). Returns: A list of Code Action objects, each describing a potential fix. Note: The range within the diagnosticObject uses 0-based indexing."
     )]
@@ -1678,10 +1663,7 @@ async fn main() -> Result<()> {
                         }
 
                         if handler_for_notif_clone
-                            .subscribed_to_diagnostics
-                            .load(Ordering::SeqCst)
-                            && handler_for_notif_clone
-                                .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
+                            .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
                         {
                             let mut enriched_params = notif_params;
                             enriched_params.insert("diagnostics".to_string(), serde_json::Value::Array(diagnostics));
