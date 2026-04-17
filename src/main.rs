@@ -1068,6 +1068,26 @@ impl MyHandler {
             for (_name, _kind, location) in lsp_results {
                 if let lsp_types::OneOf::Left(location) = location {
                     let url = Url::parse(&location.uri.to_string()).unwrap();
+                    let mut result_pos = location.range.start;
+
+                    if let Ok(abs_path) = url.to_file_path() {
+                        // Snapping logic: if the name is not at the position, try to find it on the line.
+                        if let Ok(content) = std::fs::read_to_string(&abs_path) {
+                            if let Some(line_str) = content.lines().nth(result_pos.line as usize) {
+                                let last_part = args
+                                    .symbol_name
+                                    .split("::")
+                                    .last()
+                                    .unwrap_or(&args.symbol_name);
+                                if !line_str[result_pos.character as usize..].starts_with(last_part) {
+                                    if let Some(offset) = line_str.find(last_part) {
+                                        result_pos.character = offset as u32;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let mut hover_info = None;
                     if args.hover_detail != "none" {
                         if let Ok(abs_path) = url.to_file_path() {
@@ -1081,7 +1101,7 @@ impl MyHandler {
                                 text_document: lsp_types::TextDocumentIdentifier {
                                     uri: location.uri.clone(),
                                 },
-                                position: location.range.start,
+                                position: result_pos,
                             },
                             work_done_progress_params: Default::default(),
                         };
@@ -1094,8 +1114,8 @@ impl MyHandler {
                     }
                     results.push(models::Location {
                         path: url.to_file_path().unwrap().to_string_lossy().to_string(),
-                        line: location.range.start.line,
-                        character: location.range.start.character,
+                        line: result_pos.line,
+                        character: result_pos.character,
                         hover_info,
                     });
                 }
