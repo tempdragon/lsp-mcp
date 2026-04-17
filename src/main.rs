@@ -1071,7 +1071,6 @@ impl MyHandler {
                     let mut result_pos = location.range.start;
 
                     if let Ok(abs_path) = url.to_file_path() {
-                        // Snapping logic: if the name is not at the position, try to find it on the line.
                         if let Ok(content) = std::fs::read_to_string(&abs_path) {
                             if let Some(line_str) = content.lines().nth(result_pos.line as usize) {
                                 let last_part = args
@@ -1079,9 +1078,33 @@ impl MyHandler {
                                     .split("::")
                                     .last()
                                     .unwrap_or(&args.symbol_name);
+                                
                                 if !line_str[result_pos.character as usize..].starts_with(last_part) {
-                                    if let Some(offset) = line_str.find(last_part) {
-                                        result_pos.character = offset as u32;
+                                    let mut best_char = result_pos.character;
+                                    let mut min_dist = i32::MAX;
+                                    let mut found = false;
+
+                                    let mut search_idx = 0;
+                                    while let Some(offset) = line_str[search_idx..].find(last_part) {
+                                        let abs_off = search_idx + offset;
+                                        let end_off = abs_off + last_part.len();
+                                        let prev_char = if abs_off > 0 { line_str.chars().nth(abs_off - 1) } else { None };
+                                        let next_char = line_str.chars().nth(end_off);
+                                        let is_prev_ok = prev_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
+                                        let is_next_ok = next_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
+                                        
+                                        if is_prev_ok && is_next_ok {
+                                            let dist = (abs_off as i32 - result_pos.character as i32).abs();
+                                            if dist < min_dist {
+                                                min_dist = dist;
+                                                best_char = abs_off as u32;
+                                                found = true;
+                                            }
+                                        }
+                                        search_idx = abs_off + 1;
+                                    }
+                                    if found {
+                                        result_pos.character = best_char;
                                     }
                                 }
                             }
@@ -1280,17 +1303,36 @@ impl MyHandler {
             find_args.file = Some(args.path.clone());
         }
 
-        let symbol_location = self.code_find_symbol(Parameters(find_args)).await?;
-        let locations: Vec<models::Location> = serde_json::from_str(&symbol_location).unwrap();
-        let Some(best_location) = locations.first() else {
+        let mut symbol_location = String::new();
+        let mut success_find = false;
+        
+        // Retry loop to handle LSP indexing latency
+        for i in 0..5 {
+            if let Ok(loc) = self.code_find_symbol(Parameters(find_args.clone())).await {
+                let locations: Vec<models::Location> = serde_json::from_str(&loc).unwrap();
+                if !locations.is_empty() {
+                    symbol_location = loc;
+                    success_find = true;
+                    break;
+                }
+            }
+            if i < 4 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (i + 1))).await;
+            }
+        }
+
+        if !success_find {
             return Err(ErrorData::internal_error(
                 format!(
-                    "Symbol '{}' not found for rename.",
+                    "Symbol '{}' not found for rename after retries.",
                     args.symbol_to_find.symbol_name
                 ),
                 None,
             ));
         };
+
+        let locations: Vec<models::Location> = serde_json::from_str(&symbol_location).unwrap();
+        let best_location = &locations[0];
 
         if let Some(lsp_client) = self.get_lsp_client().await {
             let mut lsp = lsp_client.lock().await;
@@ -1302,9 +1344,7 @@ impl MyHandler {
                 character: best_location.character,
             };
 
-            // Snapping logic: if the name is not at the position, try to find it on the line.
-            // This is necessary because some LSP servers return the start of the 'fn' or attributes
-            // for the symbol range, but rename requires the cursor to be on the identifier.
+            // Snapping logic: find the closest identifier on the line that matches word boundaries.
             if let Ok(content) = std::fs::read_to_string(&abs_path) {
                 if let Some(line_str) = content.lines().nth(position.line as usize) {
                     let last_part = args
@@ -1313,9 +1353,33 @@ impl MyHandler {
                         .split("::")
                         .last()
                         .unwrap_or(&args.symbol_to_find.symbol_name);
+                    
                     if !line_str[position.character as usize..].starts_with(last_part) {
-                        if let Some(offset) = line_str.find(last_part) {
-                            position.character = offset as u32;
+                        let mut best_char = position.character;
+                        let mut min_dist = i32::MAX;
+                        let mut found = false;
+
+                        let mut search_idx = 0;
+                        while let Some(offset) = line_str[search_idx..].find(last_part) {
+                            let abs_off = search_idx + offset;
+                            let end_off = abs_off + last_part.len();
+                            let prev_char = if abs_off > 0 { line_str.chars().nth(abs_off - 1) } else { None };
+                            let next_char = line_str.chars().nth(end_off);
+                            let is_prev_ok = prev_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
+                            let is_next_ok = next_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
+                            
+                            if is_prev_ok && is_next_ok {
+                                let dist = (abs_off as i32 - position.character as i32).abs();
+                                if dist < min_dist {
+                                    min_dist = dist;
+                                    best_char = abs_off as u32;
+                                    found = true;
+                                }
+                            }
+                            search_idx = abs_off + 1;
+                        }
+                        if found {
+                            position.character = best_char;
                         }
                     }
                 }
