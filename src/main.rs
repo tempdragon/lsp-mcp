@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
 use url::Url;
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FindSymbolArgs {
     /// The name of the symbol to find (e.g., a function or class name).
@@ -44,7 +44,7 @@ struct FindSymbolArgs {
     feeling_lucky: bool,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PathLineCharArgs {
     /// The absolute path to the file.
@@ -55,7 +55,7 @@ struct PathLineCharArgs {
     character: u32,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ShowSubSymbolArgs {
     /// The name of the symbol to inspect (e.g., a class name).
@@ -67,21 +67,21 @@ struct ShowSubSymbolArgs {
     level: u32,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GetActionsArgs {
     /// The full, enriched diagnostic object. (Note: The range within this object uses 0-based indexing.)
     diagnostic_object: models::EnrichedDiagnostic,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ApplyActionArgs {
     /// The specific action object to execute, as returned by code_get_actions_for_diagnostic.
     action_object: models::CodeAction,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 struct InteractiveRenameArgs {
     /// The path to a file containing an instance of the symbol.
@@ -92,7 +92,7 @@ struct InteractiveRenameArgs {
     new_name: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GetCompletionsArgs {
     /// The absolute or relative path to the file.
@@ -345,7 +345,7 @@ impl MyHandler {
                             .to_string()
                             .parse()
                             .unwrap(),
-                        range: s.range,
+                        range: s.selection_range,
                     }),
                 ));
             }
@@ -1255,31 +1255,62 @@ impl MyHandler {
         &self,
         Parameters(args): Parameters<InteractiveRenameArgs>,
     ) -> Result<String, ErrorData> {
+        let mut find_args = args.symbol_to_find.clone();
+        if find_args.file.is_none() {
+            find_args.file = Some(args.path.clone());
+        }
+
+        let symbol_location = self.code_find_symbol(Parameters(find_args)).await?;
+        let locations: Vec<models::Location> = serde_json::from_str(&symbol_location).unwrap();
+        let Some(best_location) = locations.first() else {
+            return Err(ErrorData::internal_error(
+                format!(
+                    "Symbol '{}' not found for rename.",
+                    args.symbol_to_find.symbol_name
+                ),
+                None,
+            ));
+        };
+
         if let Some(lsp_client) = self.get_lsp_client().await {
             let mut lsp = lsp_client.lock().await;
-            let abs_path = self.to_absolute_path(&args.path);
+            let abs_path = self.to_absolute_path(&best_location.path);
             let _ = lsp.ensure_file_open(&abs_path).await;
-            let position = args
-                .symbol_to_find
-                .location_hint
-                .clone()
-                .unwrap_or(models::Position {
-                    line: 0,
-                    character: 0,
-                });
+
+            let mut position = lsp_types::Position {
+                line: best_location.line,
+                character: best_location.character,
+            };
+
+            // Snapping logic: if the name is not at the position, try to find it on the line.
+            // This is necessary because some LSP servers return the start of the 'fn' or attributes
+            // for the symbol range, but rename requires the cursor to be on the identifier.
+            if let Ok(content) = std::fs::read_to_string(&abs_path) {
+                if let Some(line_str) = content.lines().nth(position.line as usize) {
+                    let last_part = args
+                        .symbol_to_find
+                        .symbol_name
+                        .split("::")
+                        .last()
+                        .unwrap_or(&args.symbol_to_find.symbol_name);
+                    if !line_str[position.character as usize..].starts_with(last_part) {
+                        if let Some(offset) = line_str.find(last_part) {
+                            position.character = offset as u32;
+                        }
+                    }
+                }
+            }
+
             let lsp_params = lsp_types::RenameParams {
                 text_document_position: lsp_types::TextDocumentPositionParams {
                     text_document: lsp_types::TextDocumentIdentifier {
-                        uri: Url::from_file_path(abs_path)
+                        uri: Url::from_file_path(&abs_path)
                             .unwrap()
                             .to_string()
                             .parse()
                             .unwrap(),
                     },
-                    position: lsp_types::Position {
-                        line: position.line,
-                        character: position.character,
-                    },
+                    position,
                 },
                 new_name: args.new_name.clone(),
                 work_done_progress_params: Default::default(),
