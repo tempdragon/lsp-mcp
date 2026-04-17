@@ -21,8 +21,8 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::sync::{Mutex, Notify};
 use url::Url;
 
 #[derive(Deserialize, JsonSchema)]
@@ -121,6 +121,10 @@ struct MyHandler {
     lsp_command: String,
     subscribed_to_diagnostics: Arc<AtomicBool>,
     workspace_diagnostics: Arc<dashmap::DashMap<String, Vec<serde_json::Value>>>,
+    diagnostics_update_seq: Arc<AtomicU64>,
+    diagnostics_notify: Arc<Notify>,
+    diagnostics_publish_seq: Arc<AtomicU64>,
+    latest_publish_by_uri: Arc<dashmap::DashMap<String, u64>>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -139,6 +143,10 @@ impl MyHandler {
             lsp_command,
             subscribed_to_diagnostics: Arc::new(AtomicBool::new(false)),
             workspace_diagnostics: Arc::new(dashmap::DashMap::new()),
+            diagnostics_update_seq: Arc::new(AtomicU64::new(0)),
+            diagnostics_notify: Arc::new(Notify::new()),
+            diagnostics_publish_seq: Arc::new(AtomicU64::new(0)),
+            latest_publish_by_uri: Arc::new(dashmap::DashMap::new()),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         }
@@ -181,6 +189,109 @@ impl MyHandler {
                 .and_then(|uri| Url::parse(&uri.to_string()).ok()?.to_file_path().ok())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             base_dir.join(path)
+        }
+    }
+
+    fn update_workspace_diagnostics_cache_by_uri(
+        &self,
+        uri_str: &str,
+        diagnostics: &[serde_json::Value],
+    ) {
+        if let Ok(url) = Url::parse(uri_str) && let Ok(path) = url.to_file_path() {
+            let path_str = path.to_string_lossy().to_string();
+            if diagnostics.is_empty() {
+                self.workspace_diagnostics.remove(&path_str);
+            } else {
+                self.workspace_diagnostics
+                    .insert(path_str, diagnostics.to_vec());
+            }
+            self.diagnostics_update_seq.fetch_add(1, Ordering::SeqCst);
+            self.diagnostics_notify.notify_waiters();
+        }
+    }
+
+    fn is_latest_publish_for_uri(&self, uri_str: &str, publish_seq: u64) -> bool {
+        self.latest_publish_by_uri
+            .get(uri_str)
+            .map(|current| *current == publish_seq)
+            .unwrap_or(false)
+    }
+
+    async fn prime_workspace_diagnostics(&self) {
+        let Some(lsp_client) = self.get_lsp_client().await else {
+            return;
+        };
+
+        let base_dir = self
+            .root_uri
+            .as_ref()
+            .and_then(|uri| Url::parse(&uri.to_string()).ok()?.to_file_path().ok())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let files = Self::find_files(&base_dir, ".rs");
+
+        let mut lsp = lsp_client.lock().await;
+        for path in files {
+            let _ = lsp.ensure_file_open(&path).await;
+
+            let Ok(uri_url) = Url::from_file_path(&path) else {
+                continue;
+            };
+            let Ok(uri) = uri_url.to_string().parse() else {
+                continue;
+            };
+            let params = lsp_types::DocumentDiagnosticParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                identifier: None,
+                previous_result_id: None,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            if let Ok(lsp_types::DocumentDiagnosticReportResult::Report(
+                lsp_types::DocumentDiagnosticReport::Full(full),
+            )) = lsp
+                .send_request::<lsp_types::request::DocumentDiagnosticRequest>(params)
+                .await
+            {
+                let diagnostics: Vec<serde_json::Value> = full
+                    .full_document_diagnostic_report
+                    .items
+                    .into_iter()
+                    .filter_map(|d| serde_json::to_value(d).ok())
+                    .collect();
+                self.update_workspace_diagnostics_cache_by_uri(uri_url.as_str(), &diagnostics);
+            }
+        }
+    }
+
+    async fn collect_cargo_check_diagnostics(&self) -> Option<String> {
+        let base_dir = self
+            .root_uri
+            .as_ref()
+            .and_then(|uri| Url::parse(&uri.to_string()).ok()?.to_file_path().ok())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+        let output = tokio::process::Command::new("cargo")
+            .arg("check")
+            .arg("--message-format")
+            .arg("short")
+            .current_dir(base_dir)
+            .output()
+            .await
+            .ok()?;
+
+        let mut lines = Vec::new();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stdout.lines().chain(stderr.lines()) {
+            if line.contains("warning:") || line.contains("error:") {
+                lines.push(line.to_string());
+            }
+        }
+
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
         }
     }
 
@@ -1215,12 +1326,15 @@ impl MyHandler {
         &self,
         _context: RequestContext<RoleServer>,
     ) -> Result<String, ErrorData> {
-        // Wait up to 10 seconds for diagnostics to populate if they are empty
-        // This is necessary because some LSP servers (like rust-analyzer) run checks asynchronously on startup.
-        let mut retries = 20;
-        while self.workspace_diagnostics.is_empty() && retries > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            retries -= 1;
+        if self.workspace_diagnostics.is_empty() {
+            self.prime_workspace_diagnostics().await;
+            let start_seq = self.diagnostics_update_seq.load(Ordering::SeqCst);
+            let notified = self.diagnostics_notify.notified();
+            if self.workspace_diagnostics.is_empty()
+                && self.diagnostics_update_seq.load(Ordering::SeqCst) == start_seq
+            {
+                let _ = tokio::time::timeout(tokio::time::Duration::from_secs(20), notified).await;
+            }
         }
 
         let mut all_diags = Vec::new();
@@ -1274,9 +1388,28 @@ impl MyHandler {
         }
 
         if all_diags.is_empty() {
+            if let Some(cargo_diags) = self.collect_cargo_check_diagnostics().await {
+                let _ = tokio::fs::write(
+                    "/tmp/ui_diag_out.log",
+                    format!("Returning cargo fallback diags:\n{}", cargo_diags),
+                )
+                .await;
+                return Ok(cargo_diags);
+            }
+            let _ = tokio::fs::write(
+                "/tmp/ui_diag_out.log",
+                format!(
+                    "Returning empty. update_seq: {}\nWorkspace diags size: {}",
+                    self.diagnostics_update_seq.load(Ordering::SeqCst),
+                    self.workspace_diagnostics.len()
+                ),
+            )
+            .await;
             Ok("No workspace diagnostics found.".to_string())
         } else {
-            Ok(all_diags.join("\n"))
+            let res = all_diags.join("\n");
+            let _ = tokio::fs::write("/tmp/ui_diag_out.log", format!("Returning diags:\n{}", res)).await;
+            Ok(res)
         }
     }
 }
@@ -1454,7 +1587,17 @@ async fn main() -> Result<()> {
                     uri_str.clone(),
                     params.get_mut("diagnostics").and_then(|d| d.as_array_mut()),
                 ) {
+                    let publish_seq = handler_for_notif
+                        .diagnostics_publish_seq
+                        .fetch_add(1, Ordering::SeqCst)
+                        + 1;
+                    handler_for_notif
+                        .latest_publish_by_uri
+                        .insert(uri_str_inner.clone(), publish_seq);
                     let mut diagnostics = diagnostics_val.clone(); // Clone for the spawned task
+                    // Cache diagnostics immediately so synchronous readers don't wait for enrichment.
+                    handler_for_notif
+                        .update_workspace_diagnostics_cache_by_uri(&uri_str_inner, &diagnostics);
                     let handler_for_notif_clone = handler_for_notif.clone();
                     let peer_clone = peer.clone();
                     let notif_params = notif["params"].as_object().cloned().unwrap_or_default();
@@ -1511,22 +1654,24 @@ async fn main() -> Result<()> {
 
                                     let path_str = path.to_string_lossy().to_string();
                                     let _ = tokio::fs::write("/tmp/diags.log", format!("Got diags for {}\n", path_str)).await;
-                                    if diagnostics.is_empty() {
-                                        handler_for_notif_clone.workspace_diagnostics.remove(&path_str);
-                                    } else {
-                                        handler_for_notif_clone
-                                            .workspace_diagnostics
-                                            .insert(path_str, diagnostics.clone().into_iter().collect());
+                                    if handler_for_notif_clone
+                                        .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
+                                    {
+                                        handler_for_notif_clone.update_workspace_diagnostics_cache_by_uri(
+                                            &uri_str_inner,
+                                            &diagnostics,
+                                        );
                                     }
                                 } else {
                                     let path_str = path.to_string_lossy().to_string();
                                     let _ = tokio::fs::write("/tmp/diags.log", format!("Got empty/failed diags for {}\n", path_str)).await;
-                                    if diagnostics.is_empty() {
-                                        handler_for_notif_clone.workspace_diagnostics.remove(&path_str);
-                                    } else {
-                                        handler_for_notif_clone
-                                            .workspace_diagnostics
-                                            .insert(path_str, diagnostics.clone().into_iter().collect());
+                                    if handler_for_notif_clone
+                                        .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
+                                    {
+                                        handler_for_notif_clone.update_workspace_diagnostics_cache_by_uri(
+                                            &uri_str_inner,
+                                            &diagnostics,
+                                        );
                                     }
                                 }
                             }
@@ -1535,6 +1680,8 @@ async fn main() -> Result<()> {
                         if handler_for_notif_clone
                             .subscribed_to_diagnostics
                             .load(Ordering::SeqCst)
+                            && handler_for_notif_clone
+                                .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
                         {
                             let mut enriched_params = notif_params;
                             enriched_params.insert("diagnostics".to_string(), serde_json::Value::Array(diagnostics));
