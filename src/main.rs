@@ -101,8 +101,22 @@ struct GetCompletionsArgs {
     line: u32,
     /// The 0-based character offset.
     character: u32,
+    /// A search string to filter the completion results.
+    query: Option<String>,
+    /// The strategy used to match the query against completion labels.
+    #[serde(default = "default_match_strategy")]
+    match_strategy: String,
+    /// Controls the verbosity of documentation.
+    #[serde(default = "default_doc_detail")]
+    documentation_detail: String,
 }
 
+fn default_match_strategy() -> String {
+    "substring".to_string()
+}
+fn default_doc_detail() -> String {
+    "summary".to_string()
+}
 fn default_hover_detail() -> String {
     "signature".to_string()
 }
@@ -195,7 +209,9 @@ impl MyHandler {
         uri_str: &str,
         diagnostics: &[serde_json::Value],
     ) {
-        if let Ok(url) = Url::parse(uri_str) && let Ok(path) = url.to_file_path() {
+        if let Ok(url) = Url::parse(uri_str)
+            && let Ok(path) = url.to_file_path()
+        {
             let path_str = path.to_string_lossy().to_string();
             if diagnostics.is_empty() {
                 self.workspace_diagnostics.remove(&path_str);
@@ -299,6 +315,57 @@ impl MyHandler {
             .trim_end_matches(';')
             .trim()
             .to_string()
+    }
+
+    fn extract_documentation(doc: &str, detail: &str) -> String {
+        match detail {
+            "none" => String::new(),
+            "summary" => doc.split("\n\n").next().unwrap_or(doc).trim().to_string(),
+            s if s.starts_with("first_n_lines:") => {
+                let n: usize = s.trim_start_matches("first_n_lines:").parse().unwrap_or(5);
+                doc.lines().take(n).collect::<Vec<_>>().join("\n")
+            }
+            s if s.starts_with("lines_a_to_b:") => {
+                let range = s.trim_start_matches("lines_a_to_b:");
+                if let Some((a_str, b_str)) = range.split_once('-') {
+                    let a: usize = a_str.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                    let b: usize = b_str.parse::<usize>().unwrap_or(usize::MAX);
+                    doc.lines()
+                        .skip(a)
+                        .take(b.saturating_sub(a))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    doc.to_string()
+                }
+            }
+            "full" => doc.to_string(),
+            _ => doc.split("\n\n").next().unwrap_or(doc).trim().to_string(),
+        }
+    }
+
+    fn matches_query(label: &str, query: &str, strategy: &str) -> bool {
+        match strategy {
+            "substring" => label.to_lowercase().contains(&query.to_lowercase()),
+            "exact" => label.to_lowercase() == query.to_lowercase(),
+            "fuzzy" => {
+                let mut label_chars = label.chars().peekable();
+                for q_char in query.chars() {
+                    let mut found = false;
+                    while let Some(l_char) = label_chars.next() {
+                        if l_char.to_lowercase().next() == q_char.to_lowercase().next() {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => label.to_lowercase().contains(&query.to_lowercase()),
+        }
     }
 
     fn find_files(dir: &std::path::Path, query: &str) -> Vec<std::path::PathBuf> {
@@ -607,6 +674,14 @@ impl MyHandler {
             }
 
             tokio::fs::write(&path, rope.to_string()).await?;
+
+            // CRITICAL: Notify the LSP that the file has changed on disk.
+            // This ensures that subsequent LSP requests (like find_symbol or rename)
+            // work with the updated content and correct line numbers.
+            if let Some(lsp_client) = self.get_lsp_client().await {
+                let lsp = lsp_client.lock().await;
+                let _ = lsp.sync_file(&path).await;
+            }
         }
         Ok(())
     }
@@ -1078,23 +1153,33 @@ impl MyHandler {
                                     .split("::")
                                     .last()
                                     .unwrap_or(&args.symbol_name);
-                                
-                                if !line_str[result_pos.character as usize..].starts_with(last_part) {
+
+                                if !line_str[result_pos.character as usize..].starts_with(last_part)
+                                {
                                     let mut best_char = result_pos.character;
                                     let mut min_dist = i32::MAX;
                                     let mut found = false;
 
                                     let mut search_idx = 0;
-                                    while let Some(offset) = line_str[search_idx..].find(last_part) {
+                                    while let Some(offset) = line_str[search_idx..].find(last_part)
+                                    {
                                         let abs_off = search_idx + offset;
                                         let end_off = abs_off + last_part.len();
-                                        let prev_char = if abs_off > 0 { line_str.chars().nth(abs_off - 1) } else { None };
+                                        let prev_char = if abs_off > 0 {
+                                            line_str.chars().nth(abs_off - 1)
+                                        } else {
+                                            None
+                                        };
                                         let next_char = line_str.chars().nth(end_off);
-                                        let is_prev_ok = prev_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
-                                        let is_next_ok = next_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
-                                        
+                                        let is_prev_ok = prev_char
+                                            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+                                        let is_next_ok = next_char
+                                            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+
                                         if is_prev_ok && is_next_ok {
-                                            let dist = (abs_off as i32 - result_pos.character as i32).abs();
+                                            let dist = (abs_off as i32
+                                                - result_pos.character as i32)
+                                                .abs();
                                             if dist < min_dist {
                                                 min_dist = dist;
                                                 best_char = abs_off as u32;
@@ -1231,7 +1316,7 @@ impl MyHandler {
     }
 
     #[tool(
-        description = "Retrieves a list of suggested code completions at a specific cursor position. I will use this tool when I am completing a partial symbol name or exploring available members at a given position to see what the Language Server suggests. Arguments: 'path' (required); 'line' (required, 0-based); 'character' (required, 0-based). Returns: A list of completion items, where each item includes a label, kind, and detail information. Note: All input and output positions are 0-based."
+        description = "Retrieves a list of suggested code completions at a specific cursor position. I will use this tool when I am completing a partial symbol name or exploring available methods/properties at a given position to see what the Language Server suggests. Arguments: 'path' (required); 'line' (required, 0-based); 'character' (required, 0-based); 'query' (optional); 'matchStrategy' (optional, default: 'substring'); 'documentationDetail' (optional, default: 'summary'). Returns: A list of completion items, where each item includes a label, kind, detail, documentation, and range. Note: All input and output positions are 0-based."
     )]
     async fn code_get_completions(
         &self,
@@ -1271,17 +1356,52 @@ impl MyHandler {
                     lsp_types::CompletionResponse::List(list) => list.items,
                 };
                 for item in items {
+                    if let Some(query) = &args.query {
+                        if !Self::matches_query(&item.label, query, &args.match_strategy) {
+                            continue;
+                        }
+                    }
+
+                    let documentation = item.documentation.map(|d| {
+                        let doc_str = match d {
+                            lsp_types::Documentation::String(s) => s,
+                            lsp_types::Documentation::MarkupContent(m) => m.value,
+                        };
+                        Self::extract_documentation(&doc_str, &args.documentation_detail)
+                    });
+
+                    let range = item.text_edit.as_ref().map(|te| match te {
+                        lsp_types::CompletionTextEdit::Edit(te) => models::TextRange {
+                            start: models::Position {
+                                line: te.range.start.line,
+                                character: te.range.start.character,
+                            },
+                            end: models::Position {
+                                line: te.range.end.line,
+                                character: te.range.end.character,
+                            },
+                        },
+                        lsp_types::CompletionTextEdit::InsertAndReplace(ir) => models::TextRange {
+                            start: models::Position {
+                                line: ir.replace.start.line,
+                                character: ir.replace.start.character,
+                            },
+                            end: models::Position {
+                                line: ir.replace.end.line,
+                                character: ir.replace.end.character,
+                            },
+                        },
+                    });
+
                     results.push(models::CompletionItem {
                         label: item.label,
                         kind: item.kind.map(|k| format!("{:?}", k)),
                         detail: item.detail,
-                        documentation: item.documentation.map(|d| match d {
-                            lsp_types::Documentation::String(s) => s,
-                            lsp_types::Documentation::MarkupContent(m) => m.value,
-                        }),
+                        documentation,
                         sort_text: item.sort_text,
                         filter_text: item.filter_text,
                         insert_text: item.insert_text,
+                        range,
                     });
                 }
             }
@@ -1305,7 +1425,7 @@ impl MyHandler {
 
         let mut symbol_location = String::new();
         let mut success_find = false;
-        
+
         // Retry loop to handle LSP indexing latency
         for i in 0..5 {
             if let Ok(loc) = self.code_find_symbol(Parameters(find_args.clone())).await {
@@ -1353,7 +1473,7 @@ impl MyHandler {
                         .split("::")
                         .last()
                         .unwrap_or(&args.symbol_to_find.symbol_name);
-                    
+
                     if !line_str[position.character as usize..].starts_with(last_part) {
                         let mut best_char = position.character;
                         let mut min_dist = i32::MAX;
@@ -1363,11 +1483,17 @@ impl MyHandler {
                         while let Some(offset) = line_str[search_idx..].find(last_part) {
                             let abs_off = search_idx + offset;
                             let end_off = abs_off + last_part.len();
-                            let prev_char = if abs_off > 0 { line_str.chars().nth(abs_off - 1) } else { None };
+                            let prev_char = if abs_off > 0 {
+                                line_str.chars().nth(abs_off - 1)
+                            } else {
+                                None
+                            };
                             let next_char = line_str.chars().nth(end_off);
-                            let is_prev_ok = prev_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
-                            let is_next_ok = next_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
-                            
+                            let is_prev_ok =
+                                prev_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
+                            let is_next_ok =
+                                next_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
+
                             if is_prev_ok && is_next_ok {
                                 let dist = (abs_off as i32 - position.character as i32).abs();
                                 if dist < min_dist {
@@ -1403,6 +1529,12 @@ impl MyHandler {
                 .send_request::<lsp_types::request::Rename>(lsp_params)
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+            // CRITICAL: Drop the lock before applying the edits.
+            // apply_workspace_edit -> apply_text_edits_to_uri will attempt to acquire this lock
+            // to call sync_file, which would cause a deadlock if we hold it here.
+            drop(lsp);
+
             if let Some(edit) = result {
                 self.apply_workspace_edit(&edit)
                     .await
@@ -1508,7 +1640,8 @@ impl MyHandler {
             Ok("No workspace diagnostics found.".to_string())
         } else {
             let res = all_diags.join("\n");
-            let _ = tokio::fs::write("/tmp/ui_diag_out.log", format!("Returning diags:\n{}", res)).await;
+            let _ = tokio::fs::write("/tmp/ui_diag_out.log", format!("Returning diags:\n{}", res))
+                .await;
             Ok(res)
         }
     }
@@ -1673,54 +1806,69 @@ async fn main() -> Result<()> {
         while let Some(mut notif) = notification_rx.recv().await {
             if let Some(method) = notif.get("method").and_then(|m| m.as_str()) {
                 use std::io::Write;
-                let mut file = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/lsp_methods.log").unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/lsp_methods.log")
+                    .unwrap();
                 writeln!(file, "Received LSP notification: {}", method).unwrap();
 
-                if method == "textDocument/publishDiagnostics" && let Some(params) = notif.get_mut("params") {
-                let uri_str = params
-                    .get("uri")
-                    .and_then(|u| u.as_str())
-                    .map(|s| s.to_string());
-                eprintln!("Received publishDiagnostics for {:?}", uri_str);
+                if method == "textDocument/publishDiagnostics"
+                    && let Some(params) = notif.get_mut("params")
+                {
+                    let uri_str = params
+                        .get("uri")
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string());
+                    eprintln!("Received publishDiagnostics for {:?}", uri_str);
 
-                if let (Some(uri_str_inner), Some(diagnostics_val)) = (
-                    uri_str.clone(),
-                    params.get_mut("diagnostics").and_then(|d| d.as_array_mut()),
-                ) {
-                    let publish_seq = handler_for_notif
-                        .diagnostics_publish_seq
-                        .fetch_add(1, Ordering::SeqCst)
-                        + 1;
-                    handler_for_notif
-                        .latest_publish_by_uri
-                        .insert(uri_str_inner.clone(), publish_seq);
-                    let mut diagnostics = diagnostics_val.clone(); // Clone for the spawned task
-                    // Cache diagnostics immediately so synchronous readers don't wait for enrichment.
-                    handler_for_notif
-                        .update_workspace_diagnostics_cache_by_uri(&uri_str_inner, &diagnostics);
-                    let handler_for_notif_clone = handler_for_notif.clone();
-                    let peer_clone = peer.clone();
-                    let notif_params = notif["params"].as_object().cloned().unwrap_or_default();
+                    if let (Some(uri_str_inner), Some(diagnostics_val)) = (
+                        uri_str.clone(),
+                        params.get_mut("diagnostics").and_then(|d| d.as_array_mut()),
+                    ) {
+                        let publish_seq = handler_for_notif
+                            .diagnostics_publish_seq
+                            .fetch_add(1, Ordering::SeqCst)
+                            + 1;
+                        handler_for_notif
+                            .latest_publish_by_uri
+                            .insert(uri_str_inner.clone(), publish_seq);
+                        let mut diagnostics = diagnostics_val.clone(); // Clone for the spawned task
+                        // Cache diagnostics immediately so synchronous readers don't wait for enrichment.
+                        handler_for_notif.update_workspace_diagnostics_cache_by_uri(
+                            &uri_str_inner,
+                            &diagnostics,
+                        );
+                        let handler_for_notif_clone = handler_for_notif.clone();
+                        let peer_clone = peer.clone();
+                        let notif_params = notif["params"].as_object().cloned().unwrap_or_default();
 
-                    tokio::spawn(async move {
-                        if let Ok(url) = Url::parse(&uri_str_inner) {
-                            if let Ok(path) = url.to_file_path() {
-                                if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                                    let lines: Vec<&str> = content.lines().collect();
-                                    let mut doc_symbols = Vec::new();
-                                    let active_lsp_client =
-                                        handler_for_notif_clone.lsp_client.lock().await.as_ref().cloned();
-                                    if let Some(lsp_client) = active_lsp_client {
-                                        let mut lsp = lsp_client.lock().await;
-                                        // CRITICAL: We must ensure the file is open before making a DocumentSymbolRequest
-                                        let _ = lsp.ensure_file_open(&path).await;
-                                        let lsp_uri: lsp_types::Uri = uri_str_inner.parse().unwrap();
-                                        let symbol_params = lsp_types::DocumentSymbolParams {
-                                            text_document: lsp_types::TextDocumentIdentifier { uri: lsp_uri },
-                                            work_done_progress_params: Default::default(),
-                                            partial_result_params: Default::default(),
-                                        };
-                                        if let Ok(Some(response)) = lsp
+                        tokio::spawn(async move {
+                            if let Ok(url) = Url::parse(&uri_str_inner) {
+                                if let Ok(path) = url.to_file_path() {
+                                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                                        let lines: Vec<&str> = content.lines().collect();
+                                        let mut doc_symbols = Vec::new();
+                                        let active_lsp_client = handler_for_notif_clone
+                                            .lsp_client
+                                            .lock()
+                                            .await
+                                            .as_ref()
+                                            .cloned();
+                                        if let Some(lsp_client) = active_lsp_client {
+                                            let mut lsp = lsp_client.lock().await;
+                                            // CRITICAL: We must ensure the file is open before making a DocumentSymbolRequest
+                                            let _ = lsp.ensure_file_open(&path).await;
+                                            let lsp_uri: lsp_types::Uri =
+                                                uri_str_inner.parse().unwrap();
+                                            let symbol_params = lsp_types::DocumentSymbolParams {
+                                                text_document: lsp_types::TextDocumentIdentifier {
+                                                    uri: lsp_uri,
+                                                },
+                                                work_done_progress_params: Default::default(),
+                                                partial_result_params: Default::default(),
+                                            };
+                                            if let Ok(Some(response)) = lsp
                                             .send_request::<lsp_types::request::DocumentSymbolRequest>(
                                                 symbol_params,
                                             )
@@ -1749,52 +1897,72 @@ async fn main() -> Result<()> {
                                                 }
                                             }
                                         }
-                                    }
-                                    MyHandler::enrich_diagnostics(&mut diagnostics, &lines, &doc_symbols, &path);
+                                        }
+                                        MyHandler::enrich_diagnostics(
+                                            &mut diagnostics,
+                                            &lines,
+                                            &doc_symbols,
+                                            &path,
+                                        );
 
-                                    let path_str = path.to_string_lossy().to_string();
-                                    let _ = tokio::fs::write("/tmp/diags.log", format!("Got diags for {}\n", path_str)).await;
-                                    if handler_for_notif_clone
-                                        .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
-                                    {
-                                        handler_for_notif_clone.update_workspace_diagnostics_cache_by_uri(
-                                            &uri_str_inner,
-                                            &diagnostics,
-                                        );
-                                    }
-                                } else {
-                                    let path_str = path.to_string_lossy().to_string();
-                                    let _ = tokio::fs::write("/tmp/diags.log", format!("Got empty/failed diags for {}\n", path_str)).await;
-                                    if handler_for_notif_clone
-                                        .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
-                                    {
-                                        handler_for_notif_clone.update_workspace_diagnostics_cache_by_uri(
-                                            &uri_str_inner,
-                                            &diagnostics,
-                                        );
+                                        let path_str = path.to_string_lossy().to_string();
+                                        let _ = tokio::fs::write(
+                                            "/tmp/diags.log",
+                                            format!("Got diags for {}\n", path_str),
+                                        )
+                                        .await;
+                                        if handler_for_notif_clone
+                                            .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
+                                        {
+                                            handler_for_notif_clone
+                                                .update_workspace_diagnostics_cache_by_uri(
+                                                    &uri_str_inner,
+                                                    &diagnostics,
+                                                );
+                                        }
+                                    } else {
+                                        let path_str = path.to_string_lossy().to_string();
+                                        let _ = tokio::fs::write(
+                                            "/tmp/diags.log",
+                                            format!("Got empty/failed diags for {}\n", path_str),
+                                        )
+                                        .await;
+                                        if handler_for_notif_clone
+                                            .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
+                                        {
+                                            handler_for_notif_clone
+                                                .update_workspace_diagnostics_cache_by_uri(
+                                                    &uri_str_inner,
+                                                    &diagnostics,
+                                                );
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        if handler_for_notif_clone
-                            .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
-                        {
-                            let mut enriched_params = notif_params;
-                            enriched_params.insert("diagnostics".to_string(), serde_json::Value::Array(diagnostics));
-                            
-                            let _ = peer_clone
-                                .send_notification(ServerNotification::CustomNotification(
-                                    CustomNotification {
-                                        method: "notifications/diagnostics".to_string(),
-                                        params: Some(serde_json::Value::Object(enriched_params)),
-                                        extensions: Default::default(),
-                                    },
-                                ))
-                                .await;
-                        }
-                    });
-                }
+                            if handler_for_notif_clone
+                                .is_latest_publish_for_uri(&uri_str_inner, publish_seq)
+                            {
+                                let mut enriched_params = notif_params;
+                                enriched_params.insert(
+                                    "diagnostics".to_string(),
+                                    serde_json::Value::Array(diagnostics),
+                                );
+
+                                let _ = peer_clone
+                                    .send_notification(ServerNotification::CustomNotification(
+                                        CustomNotification {
+                                            method: "notifications/diagnostics".to_string(),
+                                            params: Some(serde_json::Value::Object(
+                                                enriched_params,
+                                            )),
+                                            extensions: Default::default(),
+                                        },
+                                    ))
+                                    .await;
+                            }
+                        });
+                    }
                 } // End of if method == "textDocument/publishDiagnostics"
             } // End of if let Some(method)
         }

@@ -47,6 +47,13 @@ pub struct SymbolMember {
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct TextRange {
+    pub start: Position,
+    pub end: Position,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CompletionItem {
     pub label: String,
     pub kind: Option<String>,
@@ -55,4 +62,5 @@ pub struct CompletionItem {
     pub sort_text: Option<String>,
     pub filter_text: Option<String>,
     pub insert_text: Option<String>,
+    pub range: Option<TextRange>,
 }

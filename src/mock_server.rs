@@ -3,9 +3,9 @@ use rmcp::{
     service::{Peer, RoleServer, serve_directly},
 };
 
-pub struct MockMcpServer;
+pub struct TestMcpServer;
 
-impl MockMcpServer {
+impl TestMcpServer {
     pub fn new() -> Self {
         Self
     }

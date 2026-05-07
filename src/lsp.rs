@@ -210,36 +210,67 @@ impl LspClient {
     }
 
     pub async fn ensure_file_open(&self, path: &std::path::Path) -> Result<()> {
-        let path_str = path.to_string_lossy().to_string();
-        if self.opened_files.contains_key(&path_str) {
-            return Ok(());
-        }
+        self.sync_file(path).await
+    }
 
+    pub async fn sync_file(&self, path: &std::path::Path) -> Result<()> {
+        let path_str = path.to_string_lossy().to_string();
         let content = tokio::fs::read_to_string(path).await?;
         let uri = Url::from_file_path(path).map_err(|_| anyhow!("Invalid file path"))?;
+        let lsp_uri: lsp_types::Uri = uri.to_string().parse()?;
 
-        // Prepare the notification manually because we can't easily use send_notification with generic N here if we want a &self method
-        let params = lsp_types::DidOpenTextDocumentParams {
-            text_document: lsp_types::TextDocumentItem {
-                uri: uri.to_string().parse()?,
-                language_id: "rust".to_string(),
-                version: 0,
-                text: content,
-            },
+        // Use a block to ensure the DashMap lock is dropped before the .await
+        let version = {
+            let entry = self.opened_files.get(&path_str);
+            entry.map(|v| *v).unwrap_or(-1)
         };
 
-        let request = json!({
-            "jsonrpc": "2.0",
-            "method": lsp_types::notification::DidOpenTextDocument::METHOD,
-            "params": params,
-        });
+        if version == -1 {
+            // File not open, send DidOpen
+            let params = lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: lsp_uri,
+                    language_id: "rust".to_string(),
+                    version: 0,
+                    text: content,
+                },
+            };
+            let request = json!({
+                "jsonrpc": "2.0",
+                "method": lsp_types::notification::DidOpenTextDocument::METHOD,
+                "params": params,
+            });
+            self.tx
+                .send((request, None))
+                .await
+                .map_err(|_| anyhow!("LSP channel closed"))?;
+            self.opened_files.insert(path_str, 0);
+        } else {
+            // File already open, send DidChange (full content sync)
+            let new_version = version + 1;
+            let params = lsp_types::DidChangeTextDocumentParams {
+                text_document: lsp_types::VersionedTextDocumentIdentifier {
+                    uri: lsp_uri,
+                    version: new_version,
+                },
+                content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: content,
+                }],
+            };
+            let request = json!({
+                "jsonrpc": "2.0",
+                "method": lsp_types::notification::DidChangeTextDocument::METHOD,
+                "params": params,
+            });
+            self.tx
+                .send((request, None))
+                .await
+                .map_err(|_| anyhow!("LSP channel closed"))?;
+            self.opened_files.insert(path_str, new_version);
+        }
 
-        self.tx
-            .send((request, None))
-            .await
-            .map_err(|_| anyhow!("LSP channel closed"))?;
-
-        self.opened_files.insert(path_str, 0);
         Ok(())
     }
 
@@ -250,6 +281,7 @@ impl LspClient {
         let method = N::METHOD;
 
         // Track opened/closed files to prevent duplicates
+        // Note: We don't hold the DashMap lock across .await here.
         if method == lsp_types::notification::DidOpenTextDocument::METHOD {
             let json_params = serde_json::to_value(&params)?;
             if let Some(uri) = json_params

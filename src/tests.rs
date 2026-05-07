@@ -426,6 +426,111 @@ async fn test_refactor_interactive_rename() {
 }
 
 #[tokio::test]
+async fn test_refactor_interactive_rename_consecutive() {
+    run_lsp_test(|ctx| async move {
+        // 1. Rename 'hello' to 'greet'
+        let mut symbol_to_find_args = serde_json::Map::new();
+        symbol_to_find_args.insert("symbolName".to_string(), serde_json::json!("hello"));
+        symbol_to_find_args.insert(
+            "locationHint".to_string(),
+            serde_json::json!({"line": 1, "character": 3}),
+        );
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            serde_json::json!(ctx.main_rs_path_str()),
+        );
+        args.insert(
+            "symbolToFind".to_string(),
+            serde_json::Value::Object(symbol_to_find_args),
+        );
+        args.insert("newName".to_string(), serde_json::json!("greet"));
+
+        let mut success1 = false;
+        for _ in 0..10 {
+            let mut params = CallToolRequestParams::new("refactor_interactive_rename".to_string());
+            params.arguments = Some(args.clone().into_iter().collect());
+
+            let result = ctx
+                .handler
+                .call_tool(
+                    params,
+                    RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+                )
+                .await;
+
+            if let Ok(res) = result {
+                if let RawContent::Text(text) = &*res.content[0] {
+                    if text.text.contains("Applied") || text.text.contains("no edits") {
+                        success1 = true;
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+        assert!(success1, "First rename failed");
+
+        // Allow rust-analyzer time to process the DidChange notification and re-index
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // 2. Rename 'greet' back to 'hello'
+        let mut symbol_to_find_args_2 = serde_json::Map::new();
+        symbol_to_find_args_2.insert("symbolName".to_string(), serde_json::json!("greet"));
+        symbol_to_find_args_2.insert(
+            "locationHint".to_string(),
+            serde_json::json!({"line": 1, "character": 3}),
+        );
+
+        let mut args_2 = serde_json::Map::new();
+        args_2.insert(
+            "path".to_string(),
+            serde_json::json!(ctx.main_rs_path_str()),
+        );
+        args_2.insert(
+            "symbolToFind".to_string(),
+            serde_json::Value::Object(symbol_to_find_args_2),
+        );
+        args_2.insert("newName".to_string(), serde_json::json!("hello"));
+
+        let mut success2 = false;
+        for _ in 0..10 {
+            let mut params_2 =
+                CallToolRequestParams::new("refactor_interactive_rename".to_string());
+            params_2.arguments = Some(args_2.clone().into_iter().collect());
+
+            let result_2 = ctx
+                .handler
+                .call_tool(
+                    params_2,
+                    RequestContext::new(RequestId::Number(0), ctx.peer.clone()),
+                )
+                .await;
+
+            if let Ok(res) = result_2 {
+                if let RawContent::Text(text) = &*res.content[0] {
+                    if text.text.contains("Applied") || text.text.contains("no edits") {
+                        success2 = true;
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+        assert!(success2, "Second rename failed");
+
+        // Verify final state on disk
+        let final_content = tokio::fs::read_to_string(&ctx.main_rs_path).await.unwrap();
+        assert!(final_content.contains("fn hello()"));
+        assert!(!final_content.contains("fn greet()"));
+
+        ctx.teardown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_code_get_actions_for_diagnostic() {
     run_lsp_test(|ctx| async move {
         let mut diag_obj = serde_json::Map::new();
